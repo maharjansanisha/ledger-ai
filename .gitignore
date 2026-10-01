@@ -1,0 +1,25 @@
+# --- Secrets (never commit) ---
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# --- Local data: the real ledger, receipt images, LLM response cache ---
+data/ledger.db
+data/eval_ledger.db
+*.db-journal
+data/images/*
+!data/images/.gitkeep
+data/cache/*
+!data/cache/.gitkeep
+
+# --- Python / tooling ---
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# --- OS / editor ---
+.DS_Store
+.vscode/
+.idea/

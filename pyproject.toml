@@ -1,0 +1,31 @@
+[project]
+name = "bahikhata-ai"
+version = "0.1.0"
+description = "Receipt-to-ledger assistant for Nepali small businesses (student MVP)."
+requires-python = ">=3.11"
+# Runtime dependencies: exactly the list approved in ARCHITECTURE.md §18.
+# sqlite3 is part of the Python standard library, so it is not listed.
+dependencies = [
+    "streamlit",        # UI
+    "pydantic>=2",      # schemas / parsing LLM output
+    "pandas",           # dashboard frames, eval metrics
+    "nepali-datetime",  # BS <-> AD conversion (verified in TASK-003)
+    "google-genai",     # Gemini SDK (verified in TASK-002)
+    "pillow",           # image checks, EXIF rotate, resize
+    "sqlglot",          # SQL safety guard (AST checks)
+    "rapidfuzz",        # fuzzy matching in evaluation
+    "python-dotenv",    # load .env into environment variables
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+]
+
+[tool.uv]
+# This is an application, not a library we publish: no build step needed.
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
