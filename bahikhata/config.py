@@ -78,6 +78,17 @@ def get_gemini_api_key() -> str:
     return key
 
 
+def get_database_url() -> str:
+    """Return DATABASE_URL (Neon owner role, Amendment A1) from the environment.
+
+    Read lazily, like the API key. Never print or log the returned value.
+    """
+    url = os.getenv("DATABASE_URL", "").strip()
+    if not url or "<" in url:
+        raise RuntimeError("DATABASE_URL is not set. Copy .env.example to .env and fill it in.")
+    return url
+
+
 def has_gemini_api_key() -> bool:
     """True if a (non-placeholder) key is configured. Safe to show in the UI."""
     try:
