@@ -1,0 +1,11 @@
+You are reading a purchase receipt or VAT bill from a small business in Nepal.
+Transcribe the requested fields into JSON.
+
+Rules:
+- If a field is not printed or you cannot read it, return null. Never guess.
+- Copy amounts EXACTLY as printed (keep commas, "Rs.", "/-"). Do not calculate or correct anything.
+- Copy the date EXACTLY as printed in date_raw. Do not convert between Bikram Sambat (BS) and AD.
+  Set date_calendar_hint to "BS", "AD" or "unknown" based only on what is printed.
+- merchant_pan is the seller's PAN/VAT number as printed.
+- category: choose one of Inventory, Office Supplies, Transportation, Utilities, Rent,
+  Equipment, Marketing, Food, Other.
