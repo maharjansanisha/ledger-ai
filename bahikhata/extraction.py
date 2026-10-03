@@ -1,4 +1,7 @@
-"""Receipt extraction orchestration (ARCHITECTURE.md §4, TASK-015, first part).
+"""Receipt extraction orchestration (ARCHITECTURE.md §4, §11, TASK-015).
+
+extract_draft(): the one function the UI and the eval both call:
+upload bytes -> intake -> extract_receipt -> normalize -> validate.
 
 extract_receipt(): processed image bytes -> ReceiptExtraction via the LLM client,
 with the A§4 failure path: if the response is not valid JSON for the schema, retry
@@ -7,18 +10,20 @@ BLOCKING EXTRACTION_FAILED flag, keeping the raw text for the audit. Provider
 errors (429, 5xx, network) also become EXTRACTION_FAILED with a user-safe message,
 so the UI never crashes and the user can type the receipt in by hand.
 
-Still to come in TASK-015, once the validator (TASK-010) and image intake
-(TASK-012) exist: extract_draft() = intake -> extract_receipt -> normalize ->
-validate, and diff_fields().
+diff_fields(): which fields the human changed, for receipt_audit.edited_fields_json.
 """
 
 import hashlib
 from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
+from typing import Any
 
 from pydantic import ValidationError
 
-from bahikhata import config, llm_client
-from bahikhata.schemas import ReceiptExtraction, ValidationFlag
+from bahikhata import config, images, llm_client
+from bahikhata.normalize import normalize_extraction
+from bahikhata.schemas import ConfirmedReceipt, ReceiptDraft, ReceiptExtraction, ReceiptStatus, ValidationFlag
+from bahikhata.validate import summarize_flags, validate_draft
 
 _RETRY_NOTE = (
     "Your previous answer could not be parsed: {error}\n"
@@ -83,3 +88,67 @@ def extract_receipt(image_bytes: bytes, *, client=None) -> ExtractionResult:
         "EXTRACTION_FAILED: the AI response could not be read twice; enter the receipt by hand"
     )]
     return result
+
+
+def extract_draft(
+    image_bytes: bytes, today: date, *, client=None
+) -> tuple[ReceiptDraft, list[ValidationFlag], ReceiptStatus, dict[str, Any]]:
+    """Upload bytes -> (draft, flags, status, audit_payload).
+
+    Raises images.ImageIntakeError (user-safe message) for an unusable file, before
+    any API call. Every other failure comes back as flags: on EXTRACTION_FAILED the
+    draft is empty so the user can type the receipt in.
+
+    flags = EXTRACTION_FAILED (if any) + normalizer N-flags + validator V-flags.
+    audit_payload holds the receipt_audit columns known at extraction time (keys
+    match db.AuditRecord); flags_at_save_json, edited_fields_json and confirmed_at
+    are added at save time (TASK-018). `today` is passed in for V8 (A§2 P10).
+    """
+    image = images.process_upload(image_bytes)
+    result = extract_receipt(image.processed_bytes, client=client)
+    if result.extraction is None:
+        draft, n_flags = ReceiptDraft(), []
+    else:
+        draft, n_flags = normalize_extraction(result.extraction)
+    v_flags, *_ = validate_draft(draft, today)
+    flags = [*result.flags, *n_flags, *v_flags]
+    status, _, _ = summarize_flags(flags)
+
+    audit_payload = {
+        "model_name": result.model_name,
+        "prompt_version": result.prompt_version,
+        "image_sha256": image.original_sha256,
+        "raw_response": result.raw_response,
+        "ai_extraction_json": result.extraction.model_dump(mode="json") if result.extraction else None,
+        "ai_draft_json": draft.model_dump(mode="json") if result.extraction else None,
+        "flags_at_extraction_json": [f.model_dump() for f in flags],
+        "extracted_at": datetime.now(timezone.utc),
+    }
+    return draft, flags, status, audit_payload
+
+
+_HEADER_FIELDS = [f for f in ConfirmedReceipt.model_fields if f in ReceiptDraft.model_fields and f != "line_items"]
+
+
+def _comparable(value):
+    if isinstance(value, str):
+        return value.strip() or None  # whitespace-only differences are not edits
+    return value
+
+
+def _line_tuple(item) -> tuple:
+    return (_comparable(item.description), item.quantity, item.unit_price_paisa, item.amount_paisa)
+
+
+def diff_fields(ai_draft: ReceiptDraft, final: ConfirmedReceipt | ReceiptDraft) -> list[str]:
+    """Names of header fields whose value changed, plus "line_items" if any line differs (A§11).
+
+    Pass ReceiptDraft() as ai_draft when extraction failed: every field the user filled counts.
+    """
+    edited = [
+        name for name in _HEADER_FIELDS
+        if _comparable(getattr(ai_draft, name)) != _comparable(getattr(final, name))
+    ]
+    if [_line_tuple(i) for i in ai_draft.line_items] != [_line_tuple(i) for i in final.line_items]:
+        edited.append("line_items")
+    return edited

@@ -20,6 +20,7 @@ import nepali_datetime
 from bahikhata import config
 from bahikhata.schemas import (
     CalendarHint,
+    Category,
     DraftLineItem,
     ExtractedLineItem,
     ReceiptDraft,
@@ -242,10 +243,17 @@ def normalize_date(date_raw: str | None, calendar_hint: CalendarHint | None = No
 
 
 def normalize_extraction(extraction: ReceiptExtraction) -> tuple[ReceiptDraft, list[ValidationFlag]]:
-    """Full ReceiptExtraction -> (ReceiptDraft, N-flags): amounts and dates. Input not modified."""
+    """Full ReceiptExtraction -> (ReceiptDraft, N-flags): amounts, dates and category.
+
+    The AI's category is kept only if it is exactly one of the enum values; anything
+    else becomes None and V9 asks the user to choose (no fuzzy mapping, TASKS C2).
+    Input not modified.
+    """
     draft, flags = normalize_amounts(extraction)
     result = normalize_date(extraction.date_raw, extraction.date_calendar_hint)
+    category = extraction.category if extraction.category in {c.value for c in Category} else None
     draft = draft.model_copy(update={
+        "category": Category(category) if category else None,
         "date_ad": result.date_ad,
         "date_bs": result.date_bs,
         "bs_year": result.bs_year,
