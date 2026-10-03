@@ -13,6 +13,8 @@ Connections are opened per operation (Neon is serverless; no global connection):
         receipt_id = db.save_confirmed_receipt(conn, receipt, image_path, audit)
 """
 
+import calendar
+from datetime import date, timedelta
 from typing import Any
 
 import psycopg
@@ -147,5 +149,111 @@ def list_receipts(conn: psycopg.Connection, limit: int = 50) -> list[dict[str, A
             " FROM receipts ORDER BY date_ad DESC, id DESC LIMIT %s",
             (limit,),
         )
+        return cur.fetchall()
+
+
+# --- Dashboard reads (ARCHITECTURE.md §3.10, Amendment A1; TASK-020) ---------
+#
+# Fixed, parameterised SQL only -- no LLM, no general "run any SQL" function.
+# Aggregation happens in SQL (SUM/GROUP BY), never by looping over rows in
+# Python. Uses the owner connection (db.get_connection / DATABASE_URL): the
+# ledger_reader read-only role is reserved for "Ask Your Ledger" (.env.example).
+
+def today() -> date:
+    """The current date. A thin wrapper so tests can monkeypatch `db.today`."""
+    return date.today()
+
+
+def month_bounds(d: date) -> tuple[date, date]:
+    """First and last day of d's calendar month."""
+    start = d.replace(day=1)
+    end = d.replace(day=calendar.monthrange(d.year, d.month)[1])
+    return start, end
+
+
+def dashboard_period(
+    period: str, today: date, custom_start: date | None = None, custom_end: date | None = None
+) -> tuple[date, date]:
+    """AD date range for the dashboard period filter. Python computes it (never SQL/the LLM).
+
+    period: "this_month", "last_month" or "custom" (requires custom_start/custom_end).
+    """
+    if period == "this_month":
+        return month_bounds(today)
+    if period == "last_month":
+        last_day_of_prev_month = today.replace(day=1) - timedelta(days=1)
+        return month_bounds(last_day_of_prev_month)
+    if period == "custom":
+        if custom_start is None or custom_end is None:
+            raise ValueError("Choose both a start and an end date for a custom range.")
+        if custom_start > custom_end:
+            raise ValueError("The start date must not be after the end date.")
+        return custom_start, custom_end
+    raise ValueError(f"Unknown period: {period!r}")
+
+
+def dashboard_total(conn: psycopg.Connection, start: date, end: date) -> int:
+    """Total spend in paisa for receipts dated in [start, end]; 0 if none match."""
+    with conn.cursor() as cur:
+        # SUM(bigint) is NUMERIC in Postgres (psycopg would hand back a Decimal);
+        # cast back to bigint so callers (format_npr, charts) always get a plain int.
+        cur.execute(
+            "SELECT COALESCE(SUM(total_paisa), 0)::bigint FROM receipts WHERE date_ad BETWEEN %s AND %s",
+            (start, end),
+        )
+        return cur.fetchone()[0]
+
+
+def dashboard_by_category(conn: psycopg.Connection, start: date, end: date) -> list[dict[str, Any]]:
+    """[{category, total_paisa, receipt_count}, ...] for [start, end], highest spend first.
+
+    Only categories with at least one matching receipt are returned.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT category, SUM(total_paisa)::bigint AS total_paisa, COUNT(*) AS receipt_count"
+            " FROM receipts WHERE date_ad BETWEEN %s AND %s"
+            " GROUP BY category ORDER BY total_paisa DESC",
+            (start, end),
+        )
+        return cur.fetchall()
+
+
+def dashboard_by_month(conn: psycopg.Connection, start: date, end: date) -> list[dict[str, Any]]:
+    """[{month, total_paisa}, ...] for [start, end], ordered oldest to newest.
+
+    `month` is the first day of each calendar month (AD); a receipt on the last
+    day of a month and one on the first of the next land in different rows.
+    Only months with at least one matching receipt are returned.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT date_trunc('month', date_ad)::date AS month, SUM(total_paisa)::bigint AS total_paisa"
+            " FROM receipts WHERE date_ad BETWEEN %s AND %s"
+            " GROUP BY month ORDER BY month",
+            (start, end),
+        )
+        return cur.fetchall()
+
+
+def dashboard_receipts(
+    conn: psycopg.Connection, start: date, end: date, status: str | None = None, limit: int = 500
+) -> list[dict[str, Any]]:
+    """Receipts dated in [start, end] (optionally filtered by status), newest first."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        if status is None:
+            cur.execute(
+                "SELECT id, date_ad, merchant_name, total_paisa, category, status, user_override"
+                " FROM receipts WHERE date_ad BETWEEN %s AND %s"
+                " ORDER BY date_ad DESC, id DESC LIMIT %s",
+                (start, end, limit),
+            )
+        else:
+            cur.execute(
+                "SELECT id, date_ad, merchant_name, total_paisa, category, status, user_override"
+                " FROM receipts WHERE date_ad BETWEEN %s AND %s AND status = %s"
+                " ORDER BY date_ad DESC, id DESC LIMIT %s",
+                (start, end, status, limit),
+            )
         return cur.fetchall()
 

@@ -205,3 +205,138 @@ def test_list_receipts_newest_first_with_limit(conn):
     rows = db.list_receipts(conn, limit=2)
     assert [r["date_ad"] for r in rows] == [date(2026, 9, 30), date(2026, 9, 15)]
     assert rows[0]["total_paisa"] == 125000
+
+
+# --- TASK-020: dashboard period math (no database needed) --------------------
+
+@pytest.mark.parametrize("day, expected", [
+    (date(2026, 10, 3), (date(2026, 10, 1), date(2026, 10, 31))),
+    (date(2026, 2, 1), (date(2026, 2, 1), date(2026, 2, 28))),   # non-leap February
+    (date(2024, 2, 15), (date(2024, 2, 1), date(2024, 2, 29))),  # leap February
+])
+def test_month_bounds(day, expected):
+    assert db.month_bounds(day) == expected
+
+
+def test_dashboard_period_this_month():
+    assert db.dashboard_period("this_month", date(2026, 10, 3)) == (date(2026, 10, 1), date(2026, 10, 31))
+
+
+def test_dashboard_period_last_month():
+    assert db.dashboard_period("last_month", date(2026, 10, 3)) == (date(2026, 9, 1), date(2026, 9, 30))
+
+
+def test_dashboard_period_last_month_january_rolls_back_to_december():
+    assert db.dashboard_period("last_month", date(2026, 1, 15)) == (date(2025, 12, 1), date(2025, 12, 31))
+
+
+def test_dashboard_period_custom():
+    start, end = date(2026, 1, 1), date(2026, 6, 30)
+    assert db.dashboard_period("custom", date(2026, 10, 3), start, end) == (start, end)
+
+
+def test_dashboard_period_custom_missing_dates_raises():
+    with pytest.raises(ValueError, match="start and an end date"):
+        db.dashboard_period("custom", date(2026, 10, 3))
+
+
+def test_dashboard_period_custom_start_after_end_raises():
+    with pytest.raises(ValueError, match="start date must not be after"):
+        db.dashboard_period("custom", date(2026, 10, 3), date(2026, 6, 1), date(2026, 1, 1))
+
+
+def test_dashboard_period_unknown_raises():
+    with pytest.raises(ValueError, match="Unknown period"):
+        db.dashboard_period("yesterday", date(2026, 10, 3))
+
+
+# --- TASK-020: dashboard aggregations ----------------------------------------
+
+def seed(conn, *, date_ad: str, total_paisa: int, category: str = "Inventory",
+         status: str = "clean", **overrides) -> int:
+    receipt = ConfirmedReceipt.model_validate({
+        **MINIMAL, "date_ad": date_ad, "total_paisa": total_paisa, "category": category,
+        "status": status, **overrides,
+    })
+    return db.save_confirmed_receipt(conn, receipt, "data/images/x.jpg", make_audit())
+
+
+@requires_test_db
+def test_dashboard_total_empty_database_returns_zero(conn):
+    assert db.dashboard_total(conn, date(2026, 9, 1), date(2026, 9, 30)) == 0
+
+
+@requires_test_db
+def test_dashboard_by_category_and_by_month_empty_database_returns_empty_list(conn):
+    assert db.dashboard_by_category(conn, date(2026, 9, 1), date(2026, 9, 30)) == []
+    assert db.dashboard_by_month(conn, date(2026, 9, 1), date(2026, 9, 30)) == []
+    assert db.dashboard_receipts(conn, date(2026, 9, 1), date(2026, 9, 30)) == []
+
+
+@requires_test_db
+def test_dashboard_total_sums_only_receipts_in_period(conn):
+    seed(conn, date_ad="2026-09-30", total_paisa=100000)  # in period
+    seed(conn, date_ad="2026-09-01", total_paisa=50000)   # in period
+    seed(conn, date_ad="2026-10-01", total_paisa=999999)  # out of period (month boundary)
+    seed(conn, date_ad="2026-08-31", total_paisa=999999)  # out of period (month boundary)
+    total = db.dashboard_total(conn, date(2026, 9, 1), date(2026, 9, 30))
+    assert total == 150000
+    assert type(total) is int  # Postgres SUM(bigint) is NUMERIC; must be cast back, not left as Decimal
+
+
+@requires_test_db
+def test_dashboard_aggregates_return_plain_int_not_decimal(conn):
+    # format_npr() and the dashboard's pandas/chart code assume int; Postgres SUM(bigint)
+    # returns NUMERIC, which psycopg would otherwise hand back as a Decimal.
+    seed(conn, date_ad="2026-09-15", total_paisa=125050, category="Food")
+    by_category = db.dashboard_by_category(conn, date(2026, 9, 1), date(2026, 9, 30))
+    by_month = db.dashboard_by_month(conn, date(2026, 9, 1), date(2026, 9, 30))
+    assert type(by_category[0]["total_paisa"]) is int
+    assert type(by_month[0]["total_paisa"]) is int
+
+
+@requires_test_db
+def test_dashboard_total_includes_receipts_with_null_optional_amounts(conn):
+    # MINIMAL has no subtotal/discount/service_charge/vat -- only total_paisa is required.
+    seed(conn, date_ad="2026-09-15", total_paisa=75000)
+    assert db.dashboard_total(conn, date(2026, 9, 1), date(2026, 9, 30)) == 75000
+
+
+@requires_test_db
+def test_dashboard_by_category_groups_and_orders_by_spend(conn):
+    seed(conn, date_ad="2026-09-01", total_paisa=100000, category="Food")
+    seed(conn, date_ad="2026-09-02", total_paisa=50000, category="Food")
+    seed(conn, date_ad="2026-09-03", total_paisa=200000, category="Inventory")
+    rows = db.dashboard_by_category(conn, date(2026, 9, 1), date(2026, 9, 30))
+    by_category = {r["category"]: r for r in rows}
+    assert set(by_category) == {"Food", "Inventory"}  # a category with no receipts (e.g. Rent) is absent
+    assert by_category["Food"]["total_paisa"] == 150000
+    assert by_category["Food"]["receipt_count"] == 2
+    assert [r["category"] for r in rows] == ["Inventory", "Food"]  # highest spend first
+
+
+@requires_test_db
+def test_dashboard_by_month_separates_receipts_on_a_month_boundary(conn):
+    seed(conn, date_ad="2026-09-30", total_paisa=100000)
+    seed(conn, date_ad="2026-10-01", total_paisa=200000)
+    rows = db.dashboard_by_month(conn, date(2026, 9, 1), date(2026, 10, 31))
+    assert [(r["month"], r["total_paisa"]) for r in rows] == [
+        (date(2026, 9, 1), 100000),
+        (date(2026, 10, 1), 200000),
+    ]
+
+
+@requires_test_db
+def test_dashboard_receipts_filters_by_status(conn):
+    seed(conn, date_ad="2026-09-01", total_paisa=100000, status="clean")
+    seed(conn, date_ad="2026-09-02", total_paisa=50000, status="invalid", user_override=True)
+    rows = db.dashboard_receipts(conn, date(2026, 9, 1), date(2026, 9, 30), status="invalid")
+    assert len(rows) == 1 and rows[0]["status"] == "invalid"
+
+
+@requires_test_db
+def test_dashboard_receipts_newest_first(conn):
+    seed(conn, date_ad="2026-09-01", total_paisa=100000)
+    seed(conn, date_ad="2026-09-20", total_paisa=200000)
+    rows = db.dashboard_receipts(conn, date(2026, 9, 1), date(2026, 9, 30))
+    assert [r["date_ad"] for r in rows] == [date(2026, 9, 20), date(2026, 9, 1)]
