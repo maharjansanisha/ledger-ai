@@ -150,17 +150,32 @@ def test_extract_receipt_fails_twice_gives_extraction_failed_and_keeps_raw():
     assert [(f.rule_id, f.severity) for f in result.flags] == [("EXTRACTION_FAILED", "BLOCKING")]
 
 
-def test_malformed_cache_file_replays_then_retries(isolated_cache):
-    """TASK-015 acceptance: edit a cache file to be malformed -> one retry -> no crash."""
+def test_malformed_cache_file_is_dropped_and_api_called_again(isolated_cache):
+    """A cached response that no longer matches the schema is discarded: a fresh API call is made."""
     extract_receipt(IMAGE, client=FakeClient(GOOD))
     (cache_file,) = isolated_cache.glob("*.json")
     entry = json.loads(cache_file.read_text())
     entry["text"] = "{broken"
     cache_file.write_text(json.dumps(entry))
 
-    result = extract_receipt(IMAGE, client=FakeClient("still {broken"))
-    assert result.extraction is None and result.attempts == 2
-    assert result.flags[0].rule_id == "EXTRACTION_FAILED"
+    client = FakeClient(GOOD)
+    result = extract_receipt(IMAGE, client=client)
+    assert len(client.calls) == 1 and result.cache_hit is False
+    assert result.extraction is not None and result.attempts == 1
+
+
+def test_unparseable_responses_are_not_cached_so_try_again_calls_the_api(isolated_cache):
+    first = extract_receipt(IMAGE, client=FakeClient("not json", "still not json"))
+    assert first.extraction is None and list(isolated_cache.glob("*.json")) == []
+
+    client = FakeClient(GOOD)  # "Try again"
+    second = extract_receipt(IMAGE, client=client)
+    assert len(client.calls) == 1 and second.extraction is not None and second.cache_hit is False
+
+
+def test_good_answer_to_the_retry_is_cached_under_its_own_key(isolated_cache):
+    extract_receipt(IMAGE, client=FakeClient("not json", GOOD))
+    assert len(list(isolated_cache.glob("*.json"))) == 1  # only the retry-with-note response
 
 
 @pytest.mark.parametrize("error, text", [

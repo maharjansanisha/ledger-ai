@@ -4,7 +4,8 @@
 - Every call is temperature 0 with JSON output.
 - Responses are cached on disk in data/cache/ (gitignored), one JSON file per key,
   key = sha256(namespace + model + prompt_version + input). The app and eval share
-  the cache, so re-running costs zero requests.
+  the cache, so re-running costs zero requests. A response that does not match the
+  response schema is never cached (and a cached one that no longer matches is dropped).
 - Errors: one automatic retry on 5xx / timeout / network failure; NO automatic
   retry on 429 (free-tier limit), so the quota is never burned in a loop.
 - This module returns raw text and never interprets, fixes or computes anything.
@@ -21,7 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from bahikhata import config
 
@@ -76,6 +77,18 @@ def _cache_write(key: str, entry: dict[str, Any]) -> None:
     (config.CACHE_DIR / f"{key}.json").write_text(
         json.dumps(entry, ensure_ascii=False, indent=1), encoding="utf-8"
     )
+
+
+def _matches_schema(text: str, response_schema: type[BaseModel] | None) -> bool:
+    """True if the text parses as the response schema (or no schema was given).
+    Only decides whether to cache; the caller still parses and validates the text itself."""
+    if response_schema is None:
+        return True
+    try:
+        response_schema.model_validate_json(text)
+    except ValidationError:
+        return False
+    return True
 
 
 def _default_client():
@@ -134,11 +147,16 @@ def _call(
     key = cache_key(namespace, model_name, prompt_version, cache_input)
     cached = _cache_read(key)
     if cached is not None:
-        return LLMResponse(cached["text"], model_name, prompt_version, cache_hit=True, latency_s=0.0)
+        if _matches_schema(cached["text"], response_schema):
+            return LLMResponse(cached["text"], model_name, prompt_version, cache_hit=True, latency_s=0.0)
+        (config.CACHE_DIR / f"{key}.json").unlink(missing_ok=True)  # e.g. hand-edited: call the API again
 
     start = time.perf_counter()
     text = _generate(client or _default_client(), model_name, contents, response_schema)
     latency = time.perf_counter() - start
+    if not _matches_schema(text, response_schema):
+        # Never cache an unparseable answer: "Try again" must reach the API, not replay it.
+        return LLMResponse(text, model_name, prompt_version, cache_hit=False, latency_s=latency)
     _cache_write(key, {
         "namespace": namespace,
         "model_name": model_name,
