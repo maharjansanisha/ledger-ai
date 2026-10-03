@@ -32,6 +32,7 @@ EVAL_RESULTS_DIR = PROJECT_ROOT / "eval" / "results"
 DEFAULT_MODEL_NAME = "gemini-3.5-flash-lite"
 MODEL_NAME: str = os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_MODEL_NAME
 LLM_TIMEOUT_SECONDS = 60
+LLM_RETRY_WAIT_SECONDS = 2               # one automatic retry on 5xx/timeout; none on 429
 
 # Active prompt versions. A version is the prompt file name in prompts/.
 # Never edit a version after it has been used in a test-split run; copy to _v2.
