@@ -1,17 +1,25 @@
 """Normalizer: transcribed text -> typed values (ARCHITECTURE.md §3.6, §8).
 
-TASK-007 scope: amounts. Amount text is parsed into integer paisa with Decimal,
-never float (decision D1). When text cannot be parsed unambiguously the result
-is None plus an N1 flag; the parser never guesses.
+Amounts (TASK-007): text -> integer paisa with Decimal, never float (decision D1).
+Dates (TASK-008): printed text -> AD date + BS date via nepali-datetime; the LLM
+never converts calendars. The calendar comes from the year-range rule
+(year >= 2070 -> BS, <= 2035 -> AD); the model's hint is used only when the year
+is two-digit.
 
-Date parsing and BS<->AD conversion are TASK-008 and are not done here:
-date_raw is copied through unchanged.
+When text cannot be read unambiguously the value is None plus a flag
+(N1 amount, N2 date); an assumed day/month order is visible as N3. Nothing guesses.
 """
 
 import re
+from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 
+import nepali_datetime
+
+from bahikhata import config
 from bahikhata.schemas import (
+    CalendarHint,
     DraftLineItem,
     ExtractedLineItem,
     ReceiptDraft,
@@ -105,7 +113,7 @@ def normalize_amounts(extraction: ReceiptExtraction) -> tuple[ReceiptDraft, list
     """Build a ReceiptDraft from an extraction, parsing the AMOUNT fields only.
 
     Text fields and date_raw are copied unchanged; date_ad/date_bs/bs_* stay None
-    (TASK-008), and category stays None (checked against the enum later, V9).
+    (normalize_extraction fills them), and category stays None (checked later, V9).
     Returns the draft plus N1 flags. The extraction is not modified.
     """
     flags: list[ValidationFlag] = []
@@ -124,3 +132,123 @@ def normalize_amounts(extraction: ReceiptExtraction) -> tuple[ReceiptDraft, list
         **amounts,
     )
     return draft, flags
+
+
+# --- Dates (TASK-008) --------------------------------------------------------
+
+_DATE_LABEL = re.compile(r"^(?:date|मिति)\s*[:.]?\s*", re.IGNORECASE)
+_CALENDAR_MARKER = re.compile(
+    r"\s*(?P<marker>b\.?\s?s\.?|a\.?\s?d\.?|वि\.?\s?सं\.?)$", re.IGNORECASE
+)
+_TRAILING_TIME = re.compile(r"\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:am|pm)?$", re.IGNORECASE)
+_NUMERIC_DATE = re.compile(r"^(\d{1,4})[-/.](\d{1,2})[-/.](\d{1,4})$")
+
+
+@dataclass
+class DateResult:
+    """Normalized date fields for a ReceiptDraft. All None when the date is absent or unreadable."""
+
+    date_ad: date | None = None
+    date_bs: str | None = None          # 'YYYY-MM-DD' in BS
+    bs_year: int | None = None
+    bs_month: int | None = None
+    flags: list[ValidationFlag] = field(default_factory=list)
+
+
+def _date_flag(rule_id: str, message: str) -> ValidationFlag:
+    return ValidationFlag(rule_id=rule_id, severity="WARNING", field="date_ad", message=message)
+
+
+def _unreadable(date_raw: str, reason: str) -> DateResult:
+    return DateResult(flags=[_date_flag("N2", f"N2: date {date_raw!r} {reason}; please enter it")])
+
+
+def normalize_date(date_raw: str | None, calendar_hint: CalendarHint | None = None) -> DateResult:
+    """Parse a printed date and fill AD + BS fields, or return None fields plus N2.
+
+    Accepts year-first ("2083-06-14", "2083/06/14 B.S.") and day-first
+    ("14/06/2083", "30/09/2026") numeric dates with -, / or . separators,
+    Devanagari digits, a leading "Date:" label and a trailing time.
+    Day-first dates where both numbers are <= 12 are read as DD/MM with an N3 warning.
+    """
+    if _is_blank(date_raw):
+        return DateResult()  # missing date: V1 reports it
+
+    s = _DATE_LABEL.sub("", date_raw.strip().translate(_DEVANAGARI_DIGITS))
+    s = _TRAILING_TIME.sub("", s)
+    marker = _CALENDAR_MARKER.search(s)
+    if marker:
+        s = s[: marker.start()]
+        hint = "AD" if marker["marker"].lower().startswith("a") else "BS"
+    else:
+        hint = calendar_hint
+    s = re.sub(r"\s*([-/.])\s*", r"\1", s.strip())
+
+    match = _NUMERIC_DATE.match(s)
+    if not match:
+        return _unreadable(date_raw, "is not a numeric day/month/year date")
+    first, second, third = match.groups()
+    flags: list[ValidationFlag] = []
+
+    if len(first) == 4:                                 # YYYY-MM-DD
+        year, month, day = int(first), int(second), int(third)
+    elif len(third) in (2, 4) and len(first) <= 2:      # DD/MM/YYYY or DD/MM/YY
+        a, b = int(first), int(second)
+        if a > 12 and b > 12:
+            return _unreadable(date_raw, "has no valid month")
+        if a <= 12 < b:                                 # only MM/DD can be valid
+            month, day = a, b
+        else:
+            day, month = a, b
+            if b <= 12 and a <= 12 and a != b:
+                flags.append(_date_flag(
+                    "N3", f"N3: day/month order in {date_raw!r} assumed DD/MM "
+                          f"(day {a}, month {b}) — check",
+                ))
+        year = int(third)
+        if len(third) == 2:                             # two-digit year: only now is the hint used
+            if hint not in ("BS", "AD"):
+                return _unreadable(date_raw, "has a two-digit year and no clear calendar")
+            year += 2000
+            if (hint == "BS") != (year >= config.BS_YEAR_MIN):
+                return _unreadable(date_raw, f"has a two-digit year that does not fit {hint}")
+    else:
+        return _unreadable(date_raw, "is not a numeric day/month/year date")
+
+    if year >= config.BS_YEAR_MIN:
+        calendar = "BS"
+    elif year <= config.AD_YEAR_MAX:
+        calendar = "AD"
+    else:
+        return _unreadable(date_raw, f"has year {year}, which is neither a plausible AD nor BS year")
+
+    try:
+        if calendar == "BS":
+            bs_date = nepali_datetime.date(year, month, day)
+            ad_date = bs_date.to_datetime_date()
+        else:
+            ad_date = date(year, month, day)
+            bs_date = nepali_datetime.date.from_datetime_date(ad_date)
+    except ValueError as exc:
+        return _unreadable(date_raw, f"is not a valid {calendar} date ({exc.args[0]})")
+
+    return DateResult(
+        date_ad=ad_date,
+        date_bs=bs_date.strftime("%Y-%m-%d"),
+        bs_year=bs_date.year,
+        bs_month=bs_date.month,
+        flags=flags,
+    )
+
+
+def normalize_extraction(extraction: ReceiptExtraction) -> tuple[ReceiptDraft, list[ValidationFlag]]:
+    """Full ReceiptExtraction -> (ReceiptDraft, N-flags): amounts and dates. Input not modified."""
+    draft, flags = normalize_amounts(extraction)
+    result = normalize_date(extraction.date_raw, extraction.date_calendar_hint)
+    draft = draft.model_copy(update={
+        "date_ad": result.date_ad,
+        "date_bs": result.date_bs,
+        "bs_year": result.bs_year,
+        "bs_month": result.bs_month,
+    })
+    return draft, flags + result.flags
