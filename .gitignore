@@ -12,6 +12,10 @@ data/images/*
 !data/images/.gitkeep
 data/cache/*
 !data/cache/.gitkeep
+# Eval receipt images stay local until masked (r001 is a medical receipt).
+data/eval/**/*.png
+data/eval/**/*.jpg
+data/eval/**/*.jpeg
 
 # --- Python / tooling ---
 .venv/
@@ -23,3 +27,6 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+
+# --- Spike outputs (may contain receipt data) ---
+scratch/outputs/
