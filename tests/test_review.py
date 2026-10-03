@@ -154,3 +154,20 @@ def test_db_error_is_a_save_error_without_details(image):
         review.save_receipt(current=review.revalidate(HEADER, ROWS, TODAY), ai_draft=ReceiptDraft(),
                             audit_payload=AUDIT, image=image, user_override=False, connect=broken_connect)
     assert "OperationalError" in str(info.value) and "secret-host" not in str(info.value)
+
+
+@pytest.mark.parametrize("flag_field, form_field", [
+    ("total_paisa", "total"), ("vat_paisa", "vat"), ("service_charge_paisa", "service_charge"),
+    ("date_ad", "date"), ("merchant_name", "merchant_name"), ("merchant_pan", "merchant_pan"),
+    ("category", "category"), ("line_items[2].amount_paisa", "line_items"), (None, None),
+])
+def test_form_field_for(flag_field, form_field):
+    assert review.form_field_for(flag_field) == form_field
+
+
+def test_save_hint():
+    assert review.save_hint(review.revalidate(HEADER, ROWS, TODAY)) is None
+    blocked = review.revalidate({**HEADER, "total": "", "category": None}, ROWS, TODAY)
+    assert review.save_hint(blocked) == "Can't save yet: total is missing; choose a category."
+    v5 = review.revalidate({**HEADER, "total": "1,220"}, ROWS, TODAY)
+    assert "save anyway" in review.save_hint(v5)

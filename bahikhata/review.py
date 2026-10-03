@@ -11,6 +11,7 @@ processed image to data/images/<sha256>.jpg and saves in one DB transaction.
 """
 
 import math
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Callable
@@ -41,6 +42,8 @@ AMOUNT_FIELDS = {
     "total": ("total_raw", "total_paisa"),
 }
 LINE_COLUMNS = ["description", "quantity", "unit_price", "amount"]
+# Form fields that block saving when empty (V1, V9); the page marks them with "*".
+REQUIRED_FORM_FIELDS = ("merchant_name", "date", "category", "total")
 CALENDARS = ["BS", "AD", "unknown"]
 
 
@@ -66,6 +69,49 @@ class Review:
 
 class SaveError(Exception):
     """Saving did not happen. str(error) is safe to show; the form keeps the user's edits."""
+
+
+# --- Flags -> form ------------------------------------------------------------
+
+_FLAG_FIELD_TO_FORM = {
+    "date_ad": "date",
+    **{paisa_field: key for key, (_, paisa_field) in AMOUNT_FIELDS.items()},
+}
+
+
+def form_field_for(flag_field: str | None) -> str | None:
+    """Which form field a flag belongs under: "total_paisa" -> "total", "date_ad" -> "date",
+    "line_items[2].amount_paisa" -> "line_items", "merchant_name" -> "merchant_name".
+    None (e.g. EXTRACTION_FAILED) means the flag belongs in the panel at the top."""
+    if flag_field is None:
+        return None
+    if flag_field.startswith("line_items"):
+        return "line_items"
+    return _FLAG_FIELD_TO_FORM.get(flag_field, flag_field)
+
+
+def flags_by_form_field(flags: list[ValidationFlag]) -> dict[str | None, list[ValidationFlag]]:
+    grouped: dict[str | None, list[ValidationFlag]] = {}
+    for flag in flags:
+        grouped.setdefault(form_field_for(flag.field), []).append(flag)
+    return grouped
+
+
+def _short_message(flag: ValidationFlag) -> str:
+    """"V1: total is missing" -> "total is missing"; drops the long category list."""
+    message = flag.message.removeprefix(f"{flag.rule_id}: ")
+    return re.sub(r"\s*\(one of:.*\)$", "", message)
+
+
+def save_hint(current: Review) -> str | None:
+    """One line under the buttons explaining why saving is not possible yet, or None."""
+    blocking = [_short_message(f) for f in current.flags if f.severity == "BLOCKING"]
+    if blocking:
+        return "Can't save yet: " + "; ".join(blocking) + "."
+    if current.needs_override:
+        return ("The amounts don't add up (V5): check them, then tick "
+                "“I checked this, save anyway” to save.")
+    return None
 
 
 # --- Text helpers ------------------------------------------------------------

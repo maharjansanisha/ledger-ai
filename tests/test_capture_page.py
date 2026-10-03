@@ -112,7 +112,7 @@ def test_extract_populates_the_form(env):
 def test_blocking_flag_disables_save(env):
     env(json.dumps({**GOOD, "total_raw": None}))
     at = extract(start(png()))
-    assert "⛔ **BLOCKING**" in text(at) and "total is missing" in text(at)
+    assert "⛔ BLOCKING: V1: total is missing" in text(at)
     assert save_button(at).disabled
 
 
@@ -143,7 +143,7 @@ def test_v5_needs_save_anyway_checkbox(env, monkeypatch):
     monkeypatch.setattr("bahikhata.db.get_connection", lambda: _FakeConn())
     monkeypatch.setattr("bahikhata.db.save_confirmed_receipt", lambda c, r, p, a: saved.setdefault("r", r) and 9)
     at = extract(start(png()))
-    assert "❗ **ERROR**" in text(at)
+    assert "❗ ERROR: V5:" in text(at)
     submit(at, "Confirm & Save")                    # without the checkbox
     assert "save anyway" in at.error[0].value and "r" not in saved
     at.checkbox(key="override_1").check()
@@ -211,3 +211,64 @@ def test_bad_upload_shows_message_not_traceback(env):
     at = start(b"this is not an image")
     assert not at.exception
     assert at.error[0].value == "This file isn't a readable image."
+
+
+def elements_in_order(at: AppTest) -> list:
+    """Every element of the page in render order (blocks such as forms and columns flattened)."""
+    def walk(node):
+        yield node
+        for child in getattr(node, "children", {}).values():
+            yield from walk(child)
+    return list(walk(at.main))
+
+
+def element_after(at: AppTest, key: str):
+    elements = elements_in_order(at)
+    index = next(i for i, e in enumerate(elements) if getattr(e, "key", None) == key)
+    return elements[index + 1]
+
+
+def save_hint_text(at: AppTest) -> str | None:
+    return next((c.value for c in at.caption if c.value.startswith("Can't save yet")), None)
+
+
+def test_missing_total_message_is_shown_under_the_total_field(env):
+    env(json.dumps({**GOOD, "total_raw": None}))
+    at = extract(start(png()))
+    below_total = element_after(at, "total_1")
+    assert below_total.type == "caption"
+    assert below_total.value == "⛔ BLOCKING: V1: total is missing"
+    assert at.text_input(key="total_1").label == "Total *"
+    assert "total is missing" not in "\n".join(m.value for m in at.markdown)  # not repeated at the top
+
+
+def test_cant_save_line_appears_then_disappears_after_fixing(env):
+    env(json.dumps({**GOOD, "total_raw": None, "date_raw": None}))
+    at = extract(start(png()))
+    assert save_hint_text(at) == "Can't save yet: date is missing or could not be read; total is missing."
+
+    at.text_input(key="total_1").set_value("1130")
+    at.text_input(key="date_raw_1").set_value("2083/06/14")
+    submit(at, "Re-validate")
+    assert save_hint_text(at) is None
+    assert not save_button(at).disabled
+    assert element_after(at, "total_1").type != "caption"  # no message under Total any more
+
+
+def test_required_marks_and_instructions(env):
+    env(json.dumps(GOOD))
+    at = extract(start(png()))
+    labels = {e.key: e.label for e in elements_in_order(at) if hasattr(e, "label") and getattr(e, "key", None)}
+    assert labels["merchant_name_1"] == "Merchant *" and labels["date_raw_1"] == "Date (as printed) *"
+    assert labels["category_1"] == "Category *" and labels["total_1"] == "Total *"
+    assert labels["subtotal_1"] == "Subtotal" and labels["merchant_pan_1"] == "PAN / VAT no."
+    captions = [c.value for c in at.caption]
+    assert "Edit, then click **Re-validate** to check your changes." in captions
+    assert "\\* required" in captions
+
+
+def test_v5_hint_mentions_the_checkbox(env):
+    env(json.dumps({**GOOD, "total_raw": "1,220"}))
+    at = extract(start(png()))
+    assert any("save anyway" in c.value and c.value.startswith("The amounts don't add up") for c in at.caption)
+    assert not save_button(at).disabled

@@ -27,6 +27,11 @@ _AMOUNT_LABELS = {"subtotal": "Subtotal", "discount": "Discount", "service_charg
                   "vat": "VAT", "total": "Total"}
 
 
+def label(text: str, form_field: str) -> str:
+    """Mark fields that block saving when empty with "*"."""
+    return f"{text} *" if form_field in review.REQUIRED_FORM_FIELDS else text
+
+
 def reset() -> None:
     for key in _SESSION_KEYS:
         S.pop(key, None)
@@ -61,18 +66,19 @@ def run_extraction() -> None:
         start_review(draft, flags, S.ai_extraction)
 
 
-def show_flags(current: review.Review) -> None:
+def show_flags(current: review.Review, grouped) -> None:
+    """Status, plus the flags that belong to no field (the rest are shown next to their fields)."""
     status_text = {"clean": "✅ clean", "needs_review": "⚠️ needs review", "invalid": "⛔ invalid"}
-    st.markdown(f"**Status:** {status_text[current.status]}")
-    for flag in current.flags:
-        where = f" · `{flag.field}`" if flag.field else ""
-        st.markdown(f"{_SEVERITY_ICON[flag.severity]} **{flag.severity}**{where} — {flag.message}")
+    inline = sum(len(flags) for field, flags in grouped.items() if field is not None)
+    note = f" · {inline} message(s) shown next to the fields below" if inline else ""
+    st.markdown(f"**Status:** {status_text[current.status]}{note}")
+    for flag in grouped.get(None, []):
+        st.markdown(f"{_SEVERITY_ICON[flag.severity]} **{flag.severity}** — {flag.message}")
 
 
-def field_error(current: review.Review, field_name: str) -> None:
-    for flag in current.flags:
-        if flag.field == field_name and flag.rule_id in ("N1", "N2", "N3"):
-            st.caption(f":red[{flag.message}]")
+def field_messages(grouped, form_field: str) -> None:
+    for flag in grouped.get(form_field, []):
+        st.caption(f"{_SEVERITY_ICON[flag.severity]} {flag.severity}: {flag.message}")
 
 
 # --- Upload -------------------------------------------------------------------
@@ -134,42 +140,52 @@ with right:
 
     # --- Review ----------------------------------------------------------------
     current: review.Review = S.current
-    show_flags(current)
+    grouped = review.flags_by_form_field(current.flags)
+    show_flags(current, grouped)
     if S.get("save_error"):
         st.error(S.save_error)
 
     v, base = S.version, S.header_base
+    st.subheader("Review")
+    st.caption("Edit, then click **Re-validate** to check your changes.")
+    st.caption("\\* required")
     with st.form(f"review_{v}"):
-        header = {
-            "merchant_name": st.text_input("Merchant", base["merchant_name"], key=f"merchant_name_{v}"),
-            "merchant_pan": st.text_input("PAN / VAT no.", base["merchant_pan"], key=f"merchant_pan_{v}"),
-            "invoice_number": st.text_input("Invoice no.", base["invoice_number"], key=f"invoice_number_{v}"),
-        }
+        header = {}
+        header["merchant_name"] = st.text_input(
+            label("Merchant", "merchant_name"), base["merchant_name"], key=f"merchant_name_{v}")
+        field_messages(grouped, "merchant_name")
+        header["merchant_pan"] = st.text_input("PAN / VAT no.", base["merchant_pan"], key=f"merchant_pan_{v}")
+        field_messages(grouped, "merchant_pan")
+        header["invoice_number"] = st.text_input("Invoice no.", base["invoice_number"], key=f"invoice_number_{v}")
+        field_messages(grouped, "invoice_number")
         col_date, col_cal = st.columns([3, 1])
-        header["date_raw"] = col_date.text_input("Date (as printed)", base["date_raw"], key=f"date_raw_{v}")
+        header["date_raw"] = col_date.text_input(
+            label("Date (as printed)", "date"), base["date_raw"], key=f"date_raw_{v}")
         header["calendar"] = col_cal.selectbox(
             "Calendar", review.CALENDARS, index=review.CALENDARS.index(base["calendar"]), key=f"calendar_{v}",
             help="Only used when the year is two digits; a 4-digit year decides by itself.",
         )
         st.caption(f"Read as: AD **{current.draft.date_ad or '—'}** · BS **{current.draft.date_bs or '—'}**")
-        field_error(current, "date_ad")
+        field_messages(grouped, "date")
 
         categories = [None] + [c.value for c in Category]
         header["category"] = st.selectbox(
-            "Category", categories, index=categories.index(base["category"]),
+            label("Category", "category"), categories, index=categories.index(base["category"]),
             format_func=lambda c: "— choose —" if c is None else c, key=f"category_{v}",
         )
+        field_messages(grouped, "category")
 
         st.markdown("**Amounts** (NPR, e.g. `1250.50`)")
-        for key, label in _AMOUNT_LABELS.items():
-            header[key] = st.text_input(label, base[key], key=f"{key}_{v}")
-            field_error(current, review.AMOUNT_FIELDS[key][1])
+        for key, text in _AMOUNT_LABELS.items():
+            header[key] = st.text_input(label(text, key), base[key], key=f"{key}_{v}")
+            field_messages(grouped, key)
 
         st.markdown("**Line items**")
         edited_rows = st.data_editor(
             S.rows_base, num_rows="dynamic", key=f"items_{v}", width="stretch",
             column_config={c: st.column_config.TextColumn(c.replace("_", " ").title()) for c in review.LINE_COLUMNS},
         )
+        field_messages(grouped, "line_items")
 
         override = False
         if current.needs_override:
@@ -181,6 +197,9 @@ with right:
             "Confirm & Save", type="primary", disabled=not current.can_save,
             help=None if current.can_save else "Fix the ⛔ problems first.",
         )
+        hint = review.save_hint(current)
+        if hint:
+            st.caption(hint)
 
     if revalidate_clicked or save_clicked:
         rows = edited_rows.to_dict("records")
