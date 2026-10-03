@@ -26,6 +26,19 @@ Comparing the task brief against PRD and ARCHITECTURE turned up these items. **N
 
 ---
 
+### Amendment A1 (2026-10-03): Neon Postgres replaces SQLite
+See ARCHITECTURE.md "Amendment A1". Impact on this plan:
+- **New TASK-005** (Neon setup + read-only role + connectivity check), first thing Saturday, ~45 m.
+- TASK-009, TASK-020, TASK-022, TASK-031 and the DB tests follow A1 (psycopg, `ledger_reader` role, postgres dialect, `ledger_eval` / `ledger_test` databases).
+- Wherever a task below says "SQLite", read "Neon Postgres" and follow A1's table.
+- Saturday gains ~45 m of work. If behind, use Saturday's existing fallbacks; do not skip the read-only role.
+
+### Amendment A2 (2026-10-03): Alembic replaces the plain-SQL migration runner
+See ARCHITECTURE.md "Amendment A2". Impact on this plan:
+- `migrations/migrate.py` and the numbered `.sql` files from A1 are replaced by Alembic revisions under `migrations/versions/`, run via `make migrate` / `make migrate-reset` (Makefile at repo root).
+- TASK-009's "applies the `ledger_reader` grants after creating tables" step is now revision `0002_grant_ledger_reader.py`, not `002_grant_ledger_reader.sql`.
+- New dependencies: `alembic`, `sqlalchemy` (Alembic's engine only — §14 "Forbidden for MVP" still bars an ORM in application code; see the updated line there).
+
 ## 1. Time Budget
 
 | Day | Date | Available (assumed) | Planned load |
@@ -443,6 +456,32 @@ Legend for **Claude Code**: 🟢 GOOD FOR CLAUDE CODE · 🔵 COLLABORATIVE · �
 
 ---
 
+### TASK-005 — Neon setup: databases, read-only role, connectivity
+**Priority:** P0 · **Est:** 45 m · **Day:** Sat (first) · **Deps:** 001 · *(added by Amendment A1)*
+
+**Purpose:** Make the cloud database and its safety boundary real before any DB code depends on it.
+
+**What I need to understand:** Postgres roles and `GRANT`; why the query role must not be the owner; why `receipt_audit` gets no grant; pooled vs direct connection strings; `sslmode=require`.
+
+**Implementation outcome:**
+- Neon console: copy the **direct** (non-pooler) connection string into `.env` as `DATABASE_URL`.
+- Neon SQL editor: create databases `ledger_eval` and `ledger_test`.
+- Create the `ledger_reader` role **with SQL** (`CREATE ROLE ledger_reader WITH LOGIN PASSWORD '…'`). Grants (`USAGE` on schema, `SELECT` on `receipts`/`line_items`) are applied by TASK-009 after the tables exist.
+- `.env`: `DATABASE_URL_READONLY`, `EVAL_DATABASE_URL`, `TEST_DATABASE_URL`.
+- `.env.example` lists all four names without values.
+- `uv add "psycopg[binary]"`, then re-export `requirements.txt`.
+- A scratch script `scratch/check_neon.py` connects with each URL and prints only `current_user` and `current_database()`.
+
+**Acceptance criteria:** All 4 URLs connect from your Mac. `ledger_reader` is **not** a member of `neon_superuser`. No URL or password appears in any committed file.
+
+**Verification:** `uv run python scratch/check_neon.py`; `git status` shows no `.env`.
+
+**Claude Code:** 🔵 It writes the check script and `.env.example`. 🟠 You do the Neon console steps and keep the passwords.
+
+**Learning checkpoint:** I can explain the three layers that stop a generated query from changing data: guard, role permissions, read-only transaction.
+
+---
+
 ### TASK-006 — Pydantic schemas
 **Priority:** P0 · **Est:** 45 m · **Day:** Fri · **Deps:** 001, 002 (spike result on nullable fields)
 
@@ -513,7 +552,7 @@ Legend for **Claude Code**: 🟢 GOOD FOR CLAUDE CODE · 🔵 COLLABORATIVE · �
 ### TASK-009 — SQLite layer
 **Priority:** P0 · **Est:** 75 m (30 Fri + 45 Sat) · **Day:** Fri–Sat · **Deps:** 006
 
-**Purpose:** The source of truth (A§7) and the only write path (A§3.9), plus the read-only executor (A§3.13).
+**Purpose:** The source of truth (A§7 with **A1 column types**) and the only write path (A§3.9), plus the read-only executor (A1: `ledger_reader` + read-only transaction + timeout). Also applies the `ledger_reader` grants after creating tables.
 
 **What I need to understand:** PK/FK and 1→N relations; NOT NULL/CHECK; transactions and rollback; `PRAGMA foreign_keys = ON`; read-only URI (`mode=ro`).
 
@@ -524,6 +563,8 @@ Legend for **Claude Code**: 🟢 GOOD FOR CLAUDE CODE · 🔵 COLLABORATIVE · �
 - A failure mid-save (e.g. invalid line item) → **nothing** saved (rollback).
 - CHECK constraints reject a bad category and `total_paisa <= 0` at DB level.
 - `run_readonly_query("DELETE FROM receipts")` raises an error, and row count is unchanged.
+- As `ledger_reader`: `SELECT * FROM receipt_audit` fails (permission denied), and `INSERT INTO receipts …` fails.
+- Tests run against `TEST_DATABASE_URL` and skip if it is not set.
 
 **Verification:** pytest using a temporary DB file.
 
@@ -763,7 +804,7 @@ Legend for **Claude Code**: 🟢 GOOD FOR CLAUDE CODE · 🔵 COLLABORATIVE · �
 
 **What I need to understand:** SQL injection; parsing SQL into a tree (AST) vs keyword matching; allowlist vs blocklist; why the guard may add `LIMIT` but never "fix" dangerous SQL.
 
-**Implementation outcome:** `sql_guard.py` returning `GuardResult(ok, sql_to_run, reason, retryable)` with sqlglot (SQLite dialect).
+**Implementation outcome:** `sql_guard.py` returning `GuardResult(ok, sql_to_run, reason, retryable)` with sqlglot (**postgres** dialect, per A1). Extra rejects: `SET`, `COPY`, `CALL`, `DO`, `pg_catalog`/`information_schema`, `pg_*` functions.
 
 **Acceptance criteria (`tests/test_sql_guard.py`):** rejects (unsafe, non-retryable):
 - `DELETE FROM receipts`, `DROP TABLE receipts`, `UPDATE …`, `INSERT …`
@@ -934,7 +975,7 @@ Accepts: simple SELECT, CTE + SELECT, JOIN `receipts`/`line_items`. Adds `LIMIT 
 **What I need to understand:** Why the eval DB is built from **ground truth** and not AI output; why `EVAL_TODAY` is fixed; comparing result sets instead of SQL text.
 
 **Implementation outcome:**
-- `eval/build_eval_db.py` → `data/eval_ledger.db` from test labels + `eval/extra_records.json` (hand-entered, covering ≥ 2 months and all categories).
+- `eval/build_eval_db.py` → Neon database **`ledger_eval`** (A1; refuses any DB name not ending in `_eval`) from test labels + `eval/extra_records.json` (hand-entered, covering ≥ 2 months and all categories).
 - `eval/questions.json` (test set): ~15 answerable with `gold_sql` and `order_matters`; 5 unsafe; 3 out-of-scope; plus `EVAL_TODAY`.
 - `eval/questions_dev.json`: ~5 extra answerable questions for iteration (pending C3 approval).
 
@@ -1268,7 +1309,7 @@ No authentication, encryption or deployment security (out of scope).
 
 **Deferred** (needs the cut line met first): PRD SHOULD S1–S6 (S6 basic image handling is already in MVP per D4), i.e. TASK-050…055. PRD STRETCH X1–X5 → TASK-060…064.
 
-**Forbidden for MVP:** RAG, vector databases, embeddings, LangChain, LlamaIndex, agents/multi-agent, chat memory, FastAPI/Flask/React, PostgreSQL/Redis/Docker/Kubernetes, authentication/multi-user, cloud deployment, microservices, mobile app/camera capture, PDF/multi-page invoices, sales/udharo ledger, inventory management, payroll, banking/Tally/IRD integrations, full accounting (double entry, P&L, VAT filing), model training/fine-tuning, OpenCV preprocessing, LLM confidence scores as a trust signal, editing/deleting saved records.
+**Forbidden for MVP:** RAG, vector databases, embeddings, LangChain, LlamaIndex, agents/multi-agent, chat memory, FastAPI/Flask/React, Redis/Docker/Kubernetes (PostgreSQL via Neon is now **approved**, Amendment A1), **an ORM in application code** (Alembic + SQLAlchemy are now **approved**, Amendment A2, but strictly as the migration engine in `migrations/` — `db.py`/`ask.py`/the dashboard keep using raw psycopg, no ORM models, no query builder), authentication/multi-user, cloud deployment, microservices, mobile app/camera capture, PDF/multi-page invoices, sales/udharo ledger, inventory management, payroll, banking/Tally/IRD integrations, full accounting (double entry, P&L, VAT filing), model training/fine-tuning, OpenCV preprocessing, LLM confidence scores as a trust signal, editing/deleting saved records.
 
 **Rule for Claude Code sessions:** if a request (from you or suggested by Claude Code) is not in PRD/ARCHITECTURE, it needs **explicit scope approval**: write it in §16 Decision Log with a reason and what gets cut to make room. Paste this into each Claude Code session:
 
@@ -1307,7 +1348,8 @@ No authentication, encryption or deployment security (out of scope).
 ### Spike Log
 | Date | Spike | Result | Consequence |
 |---|---|---|---|
-| | TASK-002 Gemini | model id: ___ ; nullable fields OK? ___ ; image OK? ___ | |
+| 2026-10-02 | TASK-002 Gemini (offline part) | Spike script `scratch/spike_gemini.py` ready. google-genai 2.26.0 converts `str \| None` to `nullable: true` client-side (schema accepted by SDK). Live call NOT yet run: Claude's sandboxes block the Gemini host (proxy 403). | San runs it on the Mac |
+| | TASK-002 Gemini (live) | model id: ___ ; nullable fields OK server-side? ___ ; image OK? ___ ; our Pydantic OK? ___ | |
 | | TASK-003 BS/AD | pairs checked: ___ ; all correct? ___ | |
 
 ### Iteration Log
@@ -1318,6 +1360,9 @@ No authentication, encryption or deployment security (out of scope).
 ### Decision Log (scope changes, fallbacks, deviations)
 | Date | Decision | Reason | What was cut / impact |
 |---|---|---|---|
+| 2026-10-03 | Amendment A1: Neon Postgres replaces SQLite | San's choice | +TASK-005 (~45 m Sat); demo needs internet for DB; ledger data stored in the cloud |
+| 2026-10-03 | ~~Schema managed by plain SQL migrations (`migrations/001_create_ledger_tables.sql`, `002_grant_ledger_reader.sql`) applied by `migrations/migrate.py` (records versions in `schema_migrations`). No Alembic/ORM.~~ Superseded same day by Amendment A2 (below). | Repeatable setup for `neondb`, `ledger_eval`, `ledger_test` | TASK-009 uses these tables instead of creating DDL in `db.py` |
+| 2026-10-03 | Amendment A2: schema now managed by **Alembic** (`migrations/versions/0001_create_ledger_tables.py`, `0002_grant_ledger_reader.py`), run via `make migrate` / `make migrate-reset`. Adds `alembic` + `sqlalchemy` as dependencies, used only as the migration engine. | San's choice; reverses the "no Alembic/ORM" line above | TASK-009 still uses these tables instead of creating DDL in `db.py`; app code (`db.py`, `ask.py`) still uses raw psycopg, no ORM |
 | | | | |
 
 ### Test-set run counter

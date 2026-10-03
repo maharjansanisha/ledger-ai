@@ -54,7 +54,7 @@ Current AI models can read receipt images, but their output can't be trusted as-
 3. System reads the image and pre-fills a structured form with merchant, date, amounts, line items and category.
 4. System runs deterministic checks and highlights problems, e.g. *"Subtotal + VAT ≠ Total (diff NPR 45)"* or *"Date missing"*.
 5. User compares the form with the image side by side, fixes any wrong fields, and clicks **Confirm & Save**.
-6. The record is stored in SQLite with the original AI output kept for audit.
+6. The record is stored in the database (Neon Postgres) with the original AI output kept for audit.
 7. User opens the **Dashboard** to see spending by category and month, and a list of saved receipts.
 8. User types a question such as *"How much did I spend on inventory last month?"* The system shows the answer, the SQL it ran, and the result rows.
 
@@ -77,7 +77,7 @@ The MVP is a **single-user, local Streamlit app** with a **reproducible evaluati
 | M3 | Deterministic normalisation: amounts to numbers, date string to AD date plus BS date (converted by a library, not the LLM) | LLMs must not do calendar maths |
 | M4 | Deterministic validation rules with flags (see §15) | Core trust mechanism |
 | M5 | Human review screen: image beside editable fields and line items, with flags shown | Human-in-the-loop |
-| M6 | Save confirmed records to SQLite, keeping both the AI output and the final values | Source of truth plus audit |
+| M6 | Save confirmed records to the database (Neon Postgres), keeping both the AI output and the final values | Source of truth plus audit |
 | M7 | Basic dashboard: total spend, spend by category, spend by month, receipts table | Makes stored data useful |
 | M8 | Chat-style "Ask your ledger" page: question → read-only SQL → result, with the SQL and rows shown | Query over the ledger |
 | M9 | SQL safety guard: read-only connection, a single SELECT only, allowed tables only | Non-negotiable safety |
@@ -114,7 +114,7 @@ These are **out of scope for this submission**. If an idea appears on this list,
 - ❌ Sales tracking or customer credit (udharo/khata) ledgers. **MVP covers purchase/expense bills only.**
 - ❌ Multi-user, login, authentication, roles, or multi-business support.
 - ❌ Mobile app or camera capture. Upload from file only; the photo can be taken on a phone.
-- ❌ Cloud deployment, hosting or Docker. Runs locally.
+- ❌ Cloud deployment, hosting or Docker. The app runs locally; only the database is hosted (Neon, Amendment A1).
 - ❌ Currencies other than NPR.
 - ❌ PDF invoices and multi-page documents.
 - ❌ Integration with Tally, accounting software or IRD systems.
@@ -179,7 +179,7 @@ Each MUST feature has acceptance criteria (AC). A feature is done only when ever
 - AC6: If ERROR flags remain, saving requires an explicit "Save anyway" acknowledgement, and the record is stored with `user_override = true`.
 
 ### FR-6 Persistence (M6)
-- AC1: Confirmed records are written to SQLite: a receipt header plus its line items.
+- AC1: Confirmed records are written to the database (Neon Postgres): a receipt header plus its line items.
 - AC2: Both the original AI extraction (JSON) and the final human-confirmed values are stored.
 - AC3: Which fields were edited by the human is recorded or derivable.
 - AC4: Saved records survive an app restart.
@@ -252,19 +252,19 @@ Also aim for: a mix of BS-dated and AD-dated receipts, at least 3 with Devanagar
 - Images are sent to a third-party model API. That is acceptable for this project and should be stated in the README.
 
 ### Seed data for query evaluation
-- A fixed SQLite database built from the confirmed test-set records (plus a few hand-entered records if needed to cover several months and categories), so query answers are known and stable.
+- A fixed evaluation database (Neon `ledger_eval`) built from the confirmed test-set records (plus a few hand-entered records if needed to cover several months and categories), so query answers are known and stable.
 
 ## 14. Database requirements
 
 Conceptual level only. Exact tables and types are decided in ARCHITECTURE.md.
 
-- **DB-1** SQLite, one local file.
+- **DB-1** Neon serverless PostgreSQL (free tier), per ARCHITECTURE Amendment A1 (2026-10-03). Previously: SQLite.
 - **DB-2** Receipt header entity: id, merchant_name, merchant_pan, invoice_number, date_ad, date_bs, bs_year, bs_month, subtotal, discount, service_charge, vat_amount, total, category, status, user_override, image_path, created_at.
 - **DB-3** Line-item entity linked to a receipt: description, quantity, unit_price, amount.
 - **DB-4** Audit data: raw AI extraction JSON, model name, prompt version, validation flags at extraction time, list of human-edited fields.
 - **DB-5** Money stored without float rounding errors (e.g. integer paisa or fixed decimal), decided in architecture.
 - **DB-6** The schema is simple enough to describe fully in the NL→SQL prompt (target: ≤ 2 queryable tables).
-- **DB-7** The NL-query feature uses a separate read-only connection.
+- **DB-7** The NL-query feature uses a separate read-only database role (`ledger_reader`) with read-only transactions.
 
 ## 15. Validation requirements
 
@@ -386,7 +386,7 @@ The submission succeeds if:
 - **Runtime:** local laptop, Python, browser UI.
 - **Budget: zero.** Free tiers and open-source tools only. Free-tier rate limits apply, so API responses must be cached to disk so that eval re-runs and UI reloads don't use up quota.
 - **Free-tier privacy:** some free API tiers allow the provider to use submitted content to improve their products. Receipts must be masked of personal data (customer names, phone numbers) before upload.
-- **Stack limits:** Python, Pydantic, SQLite, Pandas, Streamlit, one LLM provider SDK, one BS↔AD date library. Any other dependency needs a stated reason.
+- **Stack limits:** Python, Pydantic, Neon Postgres (psycopg), Pandas, Streamlit, one LLM provider SDK, one BS↔AD date library. Any other dependency needs a stated reason.
 
 ## 21. Risks
 
@@ -453,7 +453,7 @@ The submission succeeds if:
 4. **Schema layer:** Pydantic models for extraction output and saved records.
 5. **Normaliser:** amounts, dates, BS↔AD conversion.
 6. **Validator:** deterministic rules → flags → status.
-7. **Persistence layer:** SQLite schema, write path, read-only query path.
+7. **Persistence layer:** Postgres schema (Neon), write path, read-only query path.
 8. **Dashboard aggregations:** SQL/Pandas summaries.
 9. **NL→SQL module:** prompt, SQL generation, safety guard, executor.
 10. **Evaluation harness:** dataset loader, field comparators, metric reports, error-analysis output.

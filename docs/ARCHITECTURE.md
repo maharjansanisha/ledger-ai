@@ -2,12 +2,71 @@
 
 | | |
 |---|---|
-| **Status** | Proposed v0.1, awaiting approval |
+| **Status** | Approved, with Amendment A1 (Neon Postgres) and Amendment A2 (Alembic migrations) |
 | **Based on** | PRD.md (approved) |
 | **Deadline** | Friday, 9 October 2026 |
 | **Audience** | San (builder), Claude Code (implementer), and evaluators |
 
 This document describes **how** the PRD is built. It adds no product features. Where it refines or questions the PRD, it says so explicitly and lists the item under §25 *Decisions Requiring Approval*.
+
+---
+
+## Amendment A1 — Neon Postgres replaces SQLite (approved 2026-10-03)
+
+**Decision (D8):** The MVP database is **Neon serverless PostgreSQL** (free tier, project `bahikhata`, region ap-southeast-1) instead of a local SQLite file. Approved by San on 2026-10-03.
+**Where this amendment conflicts with any section below, this amendment wins.** Principles P1–P11 are unchanged except P6 (see below).
+
+### What changes
+
+| Area | Before (SQLite) | After (Neon Postgres) |
+|---|---|---|
+| Driver | `sqlite3` (stdlib) | **`psycopg` v3** (`psycopg[binary]`) for all application code. No ORM. (SQLAlchemy is present only as Alembic's migration engine inside `migrations/`; see Amendment A2.) |
+| Connection strings | file path in `config.py` | `.env`: `DATABASE_URL` (owner role, writes + DDL) and `DATABASE_URL_READONLY` (read-only role, queries). Both are secrets and gitignored. |
+| Pooled vs direct host | n/a | Use the **direct** (non-`-pooler`) host for the app. It is single-user, so no pooling is needed, and the direct host supports per-connection settings such as `statement_timeout`. |
+| Read-only executor (A§3.13) | `mode=ro` file URI | Separate role **`ledger_reader`**, created **with SQL** (`CREATE ROLE … LOGIN`), so it does not inherit Neon's console-role privileges. It has `GRANT SELECT` on `receipts` and `line_items` **only** (no access to `receipt_audit`). Every query connection also sets `default_transaction_read_only=on` and `statement_timeout=5s`. |
+| Defence in depth (A§6, A§15) | guard + sqlite single-statement + `mode=ro` | guard + **DB-enforced role permissions** (table level) + read-only transaction + timeout. Note: psycopg **does** allow several statements in one `execute()` without parameters, so the sqlite "single statement" barrier no longer exists. The guard's single-statement rule is now the only check at the code level, and the role is the hard stop. |
+| SQL guard dialect (A§3.12) | `sqlglot` SQLite dialect | `sqlglot` **postgres** dialect. Additional rejects: `SET`, `COPY`, `CALL`, `DO`, `LISTEN/NOTIFY`, references to `pg_catalog` / `information_schema`, and functions starting with `pg_` (e.g. `pg_sleep`, `pg_read_file`). |
+| Column types (A§7) | INTEGER / TEXT / INTEGER flags | ids `BIGINT GENERATED ALWAYS AS IDENTITY`; money `BIGINT` (still **paisa**, D1 unchanged); `date_ad` **`DATE`**; `date_bs` `TEXT`; `bs_year`/`bs_month` `SMALLINT`; `user_override` `BOOLEAN`; timestamps `TIMESTAMPTZ`; audit JSON columns `JSONB`. CHECK constraints, NOT NULLs and FKs unchanged. |
+| SQL prompt (A§6) | SQLite SQL, `strftime` | PostgreSQL SQL (`date_trunc`, `EXTRACT`). Python still precomputes date ranges, and the money-alias rule is unchanged. |
+| Dashboard reads (A§3.10) | sqlite + pandas | psycopg cursor → `pandas.DataFrame(rows, columns=…)`. Do not use `pd.read_sql` (it wants SQLAlchemy). Parameters use `%s` placeholders, never string formatting. |
+| Eval DB (A§16.2) | `data/eval_ledger.db` | Separate Neon database **`ledger_eval`** in the same project (`EVAL_DATABASE_URL`). `build_eval_db.py` refuses to run unless the database name ends in `_eval`. |
+| Unit/integration tests | temp SQLite file | Separate Neon database **`ledger_test`** (`TEST_DATABASE_URL`). DB tests **skip** if the variable is not set, and tests clean up their own rows. Normalizer, validator and guard tests need no database. |
+| P6 Local-first | everything local | **Ledger data and audit JSON are stored in Neon (cloud).** Receipt images stay local in `data/images/`. Disclose this in the README together with the Gemini note. |
+
+### Unchanged
+Integer paisa (D1), blocking vs overridable rules (D2), amounts as text from the LLM (D3), 3 tables with `receipt_audit` not queryable (D5), sqlglot AST guard (D6), date rules (D7), the human confirm step, the evaluation protocol, and Streamlit.
+
+### New risks
+| Risk | Mitigation |
+|---|---|
+| Demo depends on internet for DB, not just Gemini | Phone hotspot as backup; backup screen recording (TASK-041) |
+| Neon compute auto-suspends when idle, so the first query after a pause is slow | Open the dashboard once before the demo to wake it |
+| Owner credentials leaked | `.env` gitignored (verified); never paste URLs into code, logs or chat |
+| Read-only role accidentally gets write rights | TASK-005 acceptance test: an `INSERT` as `ledger_reader` must fail |
+
+---
+
+## Amendment A2 — Alembic replaces the plain-SQL migration runner (approved 2026-10-03)
+
+**Decision:** Schema migrations are managed by **Alembic** instead of the hand-rolled `migrations/migrate.py` runner introduced earlier the same day. Approved by San on 2026-10-03.
+**Where this amendment conflicts with Amendment A1 or any section below, this amendment wins.** This reverses the "No Alembic/ORM" line from A1's decision log only; every other A1 decision (psycopg driver for app code, `ledger_reader` role, postgres guard dialect, column types, three tables) is unchanged.
+
+### What changes
+
+| Area | Before (A1) | After (A2) |
+|---|---|---|
+| Migration tool | Plain numbered `.sql` files (`migrations/001_...`, `002_...`) applied by a custom `migrations/migrate.py` script; versions recorded in a hand-made `schema_migrations` table | **Alembic** revisions (`migrations/versions/0001_create_ledger_tables.py`, `0002_grant_ledger_reader.py`); versions recorded in Alembic's own `alembic_version` table |
+| New dependency | — | **`alembic`** and **`sqlalchemy`** (Alembic's dependency). Used **only** as the migration engine — app code (`db.py`, `ask.py`, the dashboard) still talks to Postgres with raw **psycopg**, never the ORM. No SQLAlchemy models exist anywhere in the app. |
+| Migration content | Raw SQL files, applied verbatim | Same DDL, wrapped in `op.execute("""...""")` inside `upgrade()`/`downgrade()` functions — each revision is reversible, not just appendable |
+| Target selection | `--target main\|eval\|test` CLI flag mapped to `DATABASE_URL` / `EVAL_DATABASE_URL` / `TEST_DATABASE_URL` | `ALEMBIC_TARGET=main\|eval\|test` env var, read by `migrations/env.py`, same three env vars and the same eval/test database-name-suffix guard |
+| Running migrations | `uv run python migrations/migrate.py --target main` | `make migrate` (wraps `alembic upgrade head`); see the Makefile for `migrate-down`, `migrate-reset`, `migrate-new`, `migrate-history`, `migrate-current` |
+
+### Why
+
+Writing and maintaining a correct, reversible migration runner by hand (transactional apply, version tracking, dry-run, multi-target guard) duplicates what Alembic already does well, and this project will keep adding tables/columns as TASK-009 and later tasks land. The forbidden-ORM principle was aimed at keeping **application** code free of an ORM layer (query building, lazy loading, session management) — it was never about the migration tool itself. A2 keeps that principle intact: SQLAlchemy is confined to `migrations/env.py` and the revision files.
+
+### Unchanged
+Everything else in Amendment A1: psycopg v3 for app code, `.env` variable names, the direct (non-pooler) Neon host, the `ledger_reader` role and its grants (now applied by revision `0002` instead of `002_grant_ledger_reader.sql`), column types, the sqlglot postgres guard dialect, and the three-table design.
 
 ---
 
@@ -867,9 +926,15 @@ bahikhata-ai/
 │   ├── test_validate.py
 │   ├── test_sql_guard.py          # includes the adversarial SQL strings
 │   └── test_db.py                 # save round-trip, FK, read-only refusal, dashboard sums
+├── migrations/                    # Alembic (Amendment A2); SQLAlchemy is used only here
+│   ├── env.py                     # ALEMBIC_TARGET=main|eval|test → DB URL; _eval/_test suffix guard
+│   ├── script.py.mako
+│   └── versions/                  # 0001_create_ledger_tables.py, 0002_grant_ledger_reader.py
 ├── docs/
 │   ├── PRD.md
 │   └── ARCHITECTURE.md
+├── alembic.ini
+├── Makefile                       # make migrate / migrate-down / migrate-reset / migrate-new …
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
@@ -1067,3 +1132,5 @@ Labelling (30 receipts) runs **in parallel** and must be complete before step 12
 | D5 | Three tables (`receipts`, `line_items` queryable; `receipt_audit` not) | Yes | Keeps the NL schema small and the guard's allowlist table-level | Audit columns in `receipts`: guard needs column-level allowlisting and the SQL prompt gets noisier. |
 | D6 | `sqlglot` for the SQL guard | Yes | AST checks are much harder to bypass than keyword lists | Keyword guard: less robust; you rely more on the read-only connection. |
 | D7 | Ambiguous day/month dates: apply DD/MM convention **with a visible warning** (N3) | Yes | Visible, reviewable assumption; avoids blocking many receipts | Always set to null: safer but forces manual date entry on many receipts. |
+| D8 | Database engine (Amendment A1) | **Neon Postgres, approved 2026-10-03** | Chosen by San | Requires psycopg, a read-only role, the postgres guard dialect, and internet for the demo |
+| D9 | Schema migration tool (Amendment A2) | **Alembic, approved 2026-10-03** | Chosen by San; reverses A1's "no Alembic/ORM" | SQLAlchemy is a new dependency, confined to `migrations/` as the migration engine only — app code keeps using raw psycopg, no ORM |
