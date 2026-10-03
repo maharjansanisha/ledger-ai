@@ -15,6 +15,9 @@ dependencies = [
     "sqlglot",          # SQL safety guard (AST checks)
     "rapidfuzz",        # fuzzy matching in evaluation
     "python-dotenv",    # load .env into environment variables
+    "psycopg[binary]>=3.3.6", # Neon Postgres driver (Amendment A1)
+    "alembic>=1.13",    # schema migrations (Amendment A2; replaces plain-SQL runner)
+    "sqlalchemy>=2.0",  # Alembic's migration engine only -- app code still uses raw psycopg
 ]
 
 [dependency-groups]
