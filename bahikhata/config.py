@@ -27,8 +27,10 @@ PROMPTS_DIR = PROJECT_ROOT / "prompts"
 EVAL_RESULTS_DIR = PROJECT_ROOT / "eval" / "results"
 
 # --- LLM provider (ARCHITECTURE.md §3.4, §13) --------------------------------
-# Exact Gemini model id is decided and recorded during TASK-002 (spike).
-MODEL_NAME: str | None = None
+# Exact Gemini model id, chosen in TASK-002 (see TASKS.md Spike Log).
+# Override with GEMINI_MODEL in .env (e.g. to try another model) without code changes.
+DEFAULT_MODEL_NAME = "gemini-3.5-flash-lite"
+MODEL_NAME: str = os.getenv("GEMINI_MODEL", "").strip() or DEFAULT_MODEL_NAME
 LLM_TIMEOUT_SECONDS = 60
 
 # Active prompt versions. A version is the prompt file name in prompts/.

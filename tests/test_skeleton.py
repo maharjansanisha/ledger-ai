@@ -1,6 +1,7 @@
 """TASK-001 smoke tests: the skeleton imports and follows the basic rules."""
 
 import ast
+import importlib
 from pathlib import Path
 
 from bahikhata import config
@@ -36,3 +37,18 @@ def test_core_package_never_imports_streamlit():
 def test_missing_api_key_gives_clear_error(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "")
     assert config.has_gemini_api_key() is False
+
+
+def test_model_name_defaults_to_spike_choice(monkeypatch):
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    reloaded = importlib.reload(config)
+    assert isinstance(reloaded.MODEL_NAME, str) and reloaded.MODEL_NAME
+
+
+def test_model_name_env_override(monkeypatch):
+    monkeypatch.setenv("GEMINI_MODEL", "some-other-model")
+    try:
+        assert importlib.reload(config).MODEL_NAME == "some-other-model"
+    finally:
+        monkeypatch.delenv("GEMINI_MODEL")
+        importlib.reload(config)

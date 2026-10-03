@@ -440,7 +440,7 @@ Legend for **Claude Code**: 🟢 GOOD FOR CLAUDE CODE · 🔵 COLLABORATIVE · �
 
 **What I need to understand:** The slice composition (PRD§13) and why the handwritten slice exists (to document a limitation, not to pass). Privacy: images go to a third-party API.
 
-**Implementation outcome:** ~30 receipts photographed and masked (customer names and phones painted out), named `r001.jpg…r030.jpg`, and assigned to `dev/` (8) or `test/` (22). Use **stratified assignment**: each slice is represented in both splits, and handwritten receipts go mostly to test. A label template JSON matching `GroundTruthReceipt` fields.
+**Implementation outcome:** ~30 receipts photographed and masked (customer names and phones painted out), named `r001…r030` (`.png` or `.jpg`), and assigned to `dev/` (8) or `test/` (22). Use **stratified assignment**: each slice is represented in both splits, and handwritten receipts go mostly to test. A label template JSON matching `GroundTruthReceipt` fields. **Ground-truth label JSON files (`r0NN.json`) are committed; receipt images are not** (gitignored under `data/eval/`, kept local until masked).
 
 **Acceptance criteria:**
 - Slice targets roughly met: ~10 PAN/VAT printed, ~8 thermal (incl. ≥ 1 restaurant with service charge), ~5 pre-printed hand-filled, ~3 handwritten, ~3 poor capture, 1–2 duplicates.
@@ -1349,7 +1349,7 @@ No authentication, encryption or deployment security (out of scope).
 | Date | Spike | Result | Consequence |
 |---|---|---|---|
 | 2026-10-02 | TASK-002 Gemini (offline part) | Spike script `scratch/spike_gemini.py` ready. google-genai 2.26.0 converts `str \| None` to `nullable: true` client-side (schema accepted by SDK). Live call NOT yet run: Claude's sandboxes block the Gemini host (proxy 403). | San runs it on the Mac |
-| | TASK-002 Gemini (live) | model id: ___ ; nullable fields OK server-side? ___ ; image OK? ___ ; our Pydantic OK? ___ | |
+| 2026-10-03 | TASK-002 Gemini (live) | model id: **`gemini-3.5-flash-lite`** (also tried `gemini-3.8-flash`). Structured output (response schema) works on real receipt images; r001 and r002 extracted well. Nullable fields OK server-side: yes (schema-mode responses contain `null`s: 2 on r001, 5 on r002). Our Pydantic OK: yes (all 3 saved responses validate against the spike `ReceiptExtraction`). Models disagree on `date_calendar_hint` for r001 (BS vs AD). `total_raw` string lengths differ between models. `gemini-3.8-flash` returned 503 UNAVAILABLE (capacity, not quota) on some calls. Deliberately broken call (bad key / wrong model) shows readable error? TBD (San). | `config.MODEL_NAME` defaults to `gemini-3.5-flash-lite`, overridable via `GEMINI_MODEL`. `date_calendar_hint` is advisory only; calendar is decided by the year-range rule (TASK-003/008). Amounts stay text and are parsed deterministically in code (D3). |
 | | TASK-003 BS/AD | pairs checked: ___ ; all correct? ___ | |
 
 ### Iteration Log
