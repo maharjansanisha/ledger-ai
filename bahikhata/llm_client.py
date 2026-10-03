@@ -27,7 +27,7 @@ from bahikhata import config
 
 
 class LLMError(Exception):
-    """A provider call failed. `kind` is "rate_limit", "unavailable" or "request";
+    """A provider call failed. `kind` is "rate_limit", "unavailable", "request" or "config";
     `user_message` is safe to show in the UI."""
 
     def __init__(self, kind: str, user_message: str, detail: str = ""):
@@ -40,6 +40,7 @@ _USER_MESSAGES = {
     "rate_limit": "Free-tier limit reached — wait a minute and retry.",
     "unavailable": "Extraction service unavailable — try again.",
     "request": "The AI service rejected the request — check the model name and API key.",
+    "config": "GEMINI_API_KEY is not set — copy .env.example to .env and add your key.",
 }
 
 
@@ -81,8 +82,12 @@ def _default_client():
     from google import genai
     from google.genai import types
 
+    try:
+        api_key = config.get_gemini_api_key()
+    except RuntimeError as exc:
+        raise LLMError("config", _USER_MESSAGES["config"]) from exc
     return genai.Client(
-        api_key=config.get_gemini_api_key(),
+        api_key=api_key,
         http_options=types.HttpOptions(timeout=config.LLM_TIMEOUT_SECONDS * 1000),
     )
 

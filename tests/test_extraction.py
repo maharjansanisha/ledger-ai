@@ -195,3 +195,10 @@ def test_live_extraction_on_dev_receipt():
     result = extract_receipt(buf.getvalue())
     assert result.flags == [], result.flags
     assert result.extraction is not None
+
+
+def test_missing_api_key_is_a_user_safe_error(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    result = extract_receipt(IMAGE)  # no fake client: the real client factory runs
+    assert result.extraction is None
+    assert "GEMINI_API_KEY is not set" in result.flags[0].message
