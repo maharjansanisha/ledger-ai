@@ -8,6 +8,7 @@ Each test starts and ends with empty tables.
 
 import os
 import re
+import time
 import types
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -20,6 +21,10 @@ from bahikhata import db
 from bahikhata.schemas import ConfirmedReceipt
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "").strip()  # .env loaded by bahikhata.config
+# Not in .env.example: a `ledger_reader`-role connection string to ledger_test, needed only to
+# test the permission half of the read-only executor (see test_run_readonly_query_role_cannot_*
+# below). See the setup note next to those tests for exactly what to run.
+TEST_DATABASE_URL_READONLY = os.getenv("TEST_DATABASE_URL_READONLY", "").strip()
 
 MINIMAL = {
     "merchant_name": "Shree Traders",
@@ -340,3 +345,102 @@ def test_dashboard_receipts_newest_first(conn):
     seed(conn, date_ad="2026-09-20", total_paisa=200000)
     rows = db.dashboard_receipts(conn, date(2026, 9, 1), date(2026, 9, 30))
     assert [r["date_ad"] for r in rows] == [date(2026, 9, 20), date(2026, 9, 1)]
+
+
+# --- TASK-022: read-only executor (db.run_readonly_query) --------------------
+#
+# These run against TEST_DATABASE_URL as the OWNER role (same connection as every
+# other test in this file), deliberately bypassing sql_guard, to prove the SECOND
+# independent lock: the session itself is forced read-only and time-capped, so a
+# write fails even though this role could otherwise write. Never run against the
+# main database (same `conn` fixture guard as the rest of this file).
+
+@requires_test_db
+def test_run_readonly_query_select_works(conn):
+    seed(conn, date_ad="2026-09-01", total_paisa=100000)
+    result = db.run_readonly_query("SELECT total_paisa FROM receipts", url=TEST_DATABASE_URL)
+    assert result.ok, result.error
+    assert result.columns == ["total_paisa"]
+    assert result.rows == [(100000,)]
+
+
+@requires_test_db
+def test_run_readonly_query_no_rows_still_reports_columns(conn):
+    result = db.run_readonly_query("SELECT id, merchant_name FROM receipts", url=TEST_DATABASE_URL)
+    assert result.ok
+    assert result.columns == ["id", "merchant_name"]
+    assert result.rows == []
+
+
+@requires_test_db
+@pytest.mark.parametrize("sql", [
+    "INSERT INTO receipts (merchant_name, date_ad, date_bs, bs_year, bs_month, total_paisa,"
+    " category, status, image_path) VALUES ('x','2026-09-01','2083-05-16',2083,5,100,"
+    "'Food','clean','x')",
+    "UPDATE receipts SET total_paisa = 0",
+    "DELETE FROM receipts",
+    "DROP TABLE receipts",
+    "CREATE TABLE evil (id int)",
+    "TRUNCATE receipts",
+], ids=["insert", "update", "delete", "drop", "create", "truncate"])
+def test_run_readonly_query_blocks_writes_even_as_the_owner_role(conn, sql):
+    seed(conn, date_ad="2026-09-01", total_paisa=100000)
+    before = count_rows(conn)
+    # run_readonly_query opens its own connection; `conn` (this fixture's) never touches the write.
+    result = db.run_readonly_query(sql, url=TEST_DATABASE_URL)
+    assert not result.ok
+    assert result.error and "database" in result.error.lower()
+    assert count_rows(conn) == before
+
+
+@requires_test_db
+def test_run_readonly_query_never_raises_a_raw_driver_error(conn):
+    # No try/except needed here: a raw psycopg.Error would fail the test by propagating.
+    result = db.run_readonly_query("SELECT * FROM nonexistent_table", url=TEST_DATABASE_URL)
+    assert not result.ok
+    assert "nonexistent_table" not in (result.error or "")  # no raw driver text leaked
+
+
+@requires_test_db
+def test_run_readonly_query_timeout_cancels_a_slow_query(conn):
+    start = time.monotonic()
+    result = db.run_readonly_query("SELECT pg_sleep(8)", url=TEST_DATABASE_URL)
+    elapsed = time.monotonic() - start
+    assert not result.ok
+    assert "long" in result.error.lower()
+    assert elapsed < 7, f"expected the 5s statement_timeout to cancel this, took {elapsed:.1f}s"
+
+
+requires_test_reader_db = pytest.mark.skipif(
+    not TEST_DATABASE_URL_READONLY,
+    reason=(
+        "TEST_DATABASE_URL_READONLY not set: this one checks the ledger_reader ROLE's own grants "
+        "(not just the read-only transaction), which needs a ledger_reader connection to ledger_test. "
+        "Setup: in the Neon SQL editor, confirm `ledger_reader` exists (TASK-005; skip if already "
+        "created for DATABASE_URL_READONLY), then run `make migrate TARGET=test` so revision 0002 "
+        "grants it SELECT on receipts/line_items in ledger_test too. Add to .env: "
+        "TEST_DATABASE_URL_READONLY=postgresql://ledger_reader:<password>@<direct-host>/ledger_test"
+        "?sslmode=require"
+    ),
+)
+
+
+@requires_test_reader_db
+def test_run_readonly_query_role_cannot_read_receipt_audit(conn):
+    seed(conn, date_ad="2026-09-01", total_paisa=100000)
+    result = db.run_readonly_query("SELECT * FROM receipt_audit", url=TEST_DATABASE_URL_READONLY)
+    assert not result.ok
+    assert "allowed to read" in result.error.lower()
+
+
+@requires_test_reader_db
+def test_run_readonly_query_role_cannot_write(conn):
+    before = count_rows(conn)
+    result = db.run_readonly_query(
+        "INSERT INTO receipts (merchant_name, date_ad, date_bs, bs_year, bs_month, total_paisa,"
+        " category, status, image_path) VALUES ('x','2026-09-01','2083-05-16',2083,5,100,"
+        "'Food','clean','x')",
+        url=TEST_DATABASE_URL_READONLY,
+    )
+    assert not result.ok
+    assert count_rows(conn) == before

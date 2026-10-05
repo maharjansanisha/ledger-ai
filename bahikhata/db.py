@@ -14,6 +14,7 @@ Connections are opened per operation (Neon is serverless; no global connection):
 """
 
 import calendar
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
@@ -256,4 +257,58 @@ def dashboard_receipts(
                 (start, end, status, limit),
             )
         return cur.fetchall()
+
+
+# --- Read-only executor (ARCHITECTURE.md §3.13, §6; Amendment A1; TASK-022) --
+#
+# Runs one already-guarded SELECT. Defence in depth even if sql_guard.check_sql
+# is bypassed: the session is forced read-only and time-capped by GUC settings
+# (so a write fails even under the owner role, as plain SQL cannot re-enable
+# writes mid-session), and the default target (DATABASE_URL_READONLY) connects
+# as `ledger_reader`, which has no grant on receipt_audit or any write grant at
+# all -- two independent locks. Never raises a raw psycopg error to the caller.
+
+@dataclass(frozen=True)
+class QueryExecutionResult:
+    ok: bool
+    columns: list[str] = field(default_factory=list)
+    rows: list[tuple[Any, ...]] = field(default_factory=list)
+    error: str | None = None
+
+
+def _safe_execution_error(exc: psycopg.Error) -> str:
+    """A short, user-safe message -- never the raw driver text (may name the host/role)."""
+    if isinstance(exc, psycopg.errors.QueryCanceled):
+        return "The query took too long and was stopped."
+    if isinstance(exc, psycopg.errors.ReadOnlySqlTransaction):
+        return "That statement would modify the database, which isn't allowed here."
+    if isinstance(exc, psycopg.errors.InsufficientPrivilege):
+        return "That query reaches data this connection isn't allowed to read."
+    return "The database could not run that query."
+
+
+def run_readonly_query(sql: str, url: str | None = None) -> QueryExecutionResult:
+    """Run one guarded SELECT (sql_guard.check_sql must have approved it first).
+
+    `url` defaults to DATABASE_URL_READONLY (the `ledger_reader` role); tests
+    pass TEST_DATABASE_URL to exercise the read-only transaction and timeout
+    without needing a reader role on the test database.
+    """
+    target = url if url is not None else config.get_database_url_readonly()
+    options = (
+        f"-c default_transaction_read_only=on "
+        f"-c statement_timeout={config.READONLY_STATEMENT_TIMEOUT_MS}"
+    )
+    try:
+        with psycopg.connect(target, options=options) as conn, conn.cursor() as cur:
+            cur.execute(sql)
+            if cur.description is None:
+                return QueryExecutionResult(ok=True)
+            return QueryExecutionResult(
+                ok=True,
+                columns=[d.name for d in cur.description],
+                rows=cur.fetchall(),
+            )
+    except psycopg.Error as exc:
+        return QueryExecutionResult(ok=False, error=_safe_execution_error(exc))
 

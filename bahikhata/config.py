@@ -59,10 +59,11 @@ AD_YEAR_MAX = 2035
 BS_YEAR_MIN = 2070
 EARLIEST_PLAUSIBLE_DATE_BS = "2075-01-01"  # V8 lower bound
 
-# --- Ask Your Ledger (ARCHITECTURE.md §5-6) ---------------------------------
+# --- Ask Your Ledger (ARCHITECTURE.md §5-6, §3.13; Amendment A1) -----------
 QUERY_ALLOWED_TABLES = ("receipts", "line_items")
 SQL_ROW_LIMIT = 200
 MAX_QUESTION_CHARS = 500
+READONLY_STATEMENT_TIMEOUT_MS = 5000  # Amendment A1: statement_timeout=5s
 
 
 def get_gemini_api_key() -> str:
@@ -87,6 +88,23 @@ def get_database_url() -> str:
     url = os.getenv("DATABASE_URL", "").strip()
     if not url or "<" in url:
         raise RuntimeError("DATABASE_URL is not set. Copy .env.example to .env and fill it in.")
+    return url
+
+
+def get_database_url_readonly() -> str:
+    """Return DATABASE_URL_READONLY (Neon `ledger_reader` role, Amendment A1).
+
+    Used only by "Ask Your Ledger" (`db.run_readonly_query`); every other read
+    in the app uses the owner connection. Read lazily, like the API key.
+    Never print or log the returned value.
+    """
+    url = os.getenv("DATABASE_URL_READONLY", "").strip()
+    if not url or "<" in url:
+        raise RuntimeError(
+            "DATABASE_URL_READONLY is not set. See .env.example and ARCHITECTURE.md "
+            "Amendment A1 / TASK-005: create the ledger_reader role in the Neon SQL editor, "
+            "grant it SELECT on receipts and line_items, then add its connection string here."
+        )
     return url
 
 
