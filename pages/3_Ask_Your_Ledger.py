@@ -5,13 +5,24 @@ question is answered on its own, and the chat log below is only a session-local
 transcript so the user can see earlier answers; re-asking a question never
 reuses a previous answer's SQL or rows, only the LLM response cache (keyed by
 question + today, ARCHITECTURE.md §3.11).
+
+answer_question() already turns every failure case it recognises into a
+QueryResult.message rather than raising. The try/except below is only for
+whatever still escapes it (e.g. a missing DATABASE_URL_READONLY) -- it logs the
+exception type and a redacted message to the terminal and shows a message that
+differs by kind (config / database / LLM / query-building), never the
+exception's own text, which could name a host or a query.
 """
+
+import logging
 
 import pandas as pd
 import streamlit as st
 
 from bahikhata import ask, config
 from bahikhata.schemas import QueryResult
+
+logger = logging.getLogger(__name__)
 
 st.set_page_config(page_title="Ask Your Ledger · BahiKhata AI", page_icon="💬", layout="wide")
 S = st.session_state
@@ -52,10 +63,15 @@ if question is not None:
         try:
             with st.spinner("Thinking…"):
                 result = ask.answer_question(question, ask.today())
-        except Exception:  # never show a traceback for an unexpected failure
+        except Exception as exc:  # never show a traceback for an unexpected failure
+            kind, user_message = ask.classify_error(exc)
+            logger.error(
+                "Ask Your Ledger failed [%s]: %s: %s",
+                kind, type(exc).__name__, ask.redact_secrets(str(exc)),
+            )
             result = QueryResult(
                 question=question,
-                message="Something went wrong answering that — try again.",
+                message=user_message,
                 prompt_version=config.SQL_PROMPT,
                 model_name=config.MODEL_NAME,
             )

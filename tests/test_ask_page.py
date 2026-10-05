@@ -8,9 +8,10 @@ already covers. No network, no database.
 
 from pathlib import Path
 
+import psycopg
 from streamlit.testing.v1 import AppTest
 
-from bahikhata import ask, config
+from bahikhata import ask, config, llm_client
 from bahikhata.schemas import QueryPlan, QueryResult
 
 PAGE = str(Path(__file__).resolve().parent.parent / "pages" / "3_Ask_Your_Ledger.py")
@@ -85,16 +86,49 @@ def test_refused_unsafe_sql_shows_message_and_sql_not_run_expander(monkeypatch):
     assert "DROP TABLE" in at.expander[0].code[0].value
 
 
-def test_unexpected_exception_from_answer_question_shows_friendly_message_no_traceback(monkeypatch):
+def test_unexpected_config_error_shows_config_message_and_logs_no_secret(monkeypatch, caplog):
+    """Reproduces the real bug: DATABASE_URL_READONLY unset raises a RuntimeError
+    that escapes answer_question entirely (TASK-025: distinguish Ask error kinds)."""
     def raise_error(question, today, **kw):
-        raise RuntimeError("boom")
+        raise RuntimeError("DATABASE_URL_READONLY is not set. postgresql://user:hunter2@host/db")
+
+    monkeypatch.setattr(ask, "answer_question", raise_error)
+    at = AppTest.from_file(PAGE, default_timeout=30)
+    at.run()
+    with caplog.at_level("ERROR"):
+        at = ask_question(at, "How much did I spend?")
+    assert not at.exception
+    assert any("contact the administrator" in i.value for i in at.info)
+    assert not any("went wrong" in i.value for i in at.info)  # no more generic message
+    our_errors = [r for r in caplog.records if r.message.startswith("Ask Your Ledger failed")]
+    assert len(our_errors) == 1
+    logged = our_errors[0].message
+    assert "RuntimeError" in logged and "config" in logged
+    assert "hunter2" not in logged and "postgresql://" not in logged  # redacted
+
+
+def test_unexpected_database_error_shows_database_message(monkeypatch):
+    def raise_error(question, today, **kw):
+        raise psycopg.OperationalError("could not connect to server")
 
     monkeypatch.setattr(ask, "answer_question", raise_error)
     at = AppTest.from_file(PAGE, default_timeout=30)
     at.run()
     at = ask_question(at, "How much did I spend?")
     assert not at.exception
-    assert any("went wrong" in i.value for i in at.info)
+    assert any("database error" in i.value.lower() for i in at.info)
+
+
+def test_unexpected_llm_error_reuses_its_own_user_message(monkeypatch):
+    def raise_error(question, today, **kw):
+        raise llm_client.LLMError("rate_limit", "Free-tier limit reached — wait a minute and retry.")
+
+    monkeypatch.setattr(ask, "answer_question", raise_error)
+    at = AppTest.from_file(PAGE, default_timeout=30)
+    at.run()
+    at = ask_question(at, "How much did I spend?")
+    assert not at.exception
+    assert any("Free-tier limit reached" in i.value for i in at.info)
 
 
 def test_multiple_questions_each_render_as_their_own_chat_turn(monkeypatch):

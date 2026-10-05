@@ -19,10 +19,17 @@ The optional result explanation (S2) is TASK-050, a P1 "SHOULD" item that
 TASKS.md §18 says not to start before the end-of-Sunday (query slice) checkpoint
 passes -- so QueryResult.explanation is always None here; it is not produced by
 this module yet.
+
+classify_error() and redact_secrets() are for the page's generic try/except
+around answer_question() -- not for anything inside this module, which already
+turns every failure case it recognises into a QueryResult.message instead of
+raising (TASK-025: distinguish Ask error kinds).
 """
 
+import re
 from datetime import date, timedelta
 
+import psycopg
 from pydantic import ValidationError
 
 from bahikhata import config, db, llm_client, sql_guard
@@ -206,3 +213,39 @@ def answer_question(question: str, today: date, *, strategy: str = "text_to_sql"
         **base, plan=plan, sql_executed=guard_result.sql_to_run,
         columns=exec_result.columns, rows=exec_result.rows, formatted_rows=formatted_rows,
     )
+
+
+# --- Error-kind classification for the page's generic catch (TASK-025) -------
+#
+# answer_question() itself never raises for a bad question, an unsafe query, or
+# a provider/database failure it recognises (see its docstring) -- these two
+# helpers are for whatever still escapes it (e.g. a missing DATABASE_URL_READONLY,
+# raised by config.get_database_url_readonly() before db.run_readonly_query's own
+# try/except even starts). classify_error() never reads the exception's own text
+# for the message it hands back, and redact_secrets() is for the separate,
+# developer-facing log line, so neither a URL, a password, nor the user's SQL can
+# reach the UI or an unredacted log.
+
+_URL_RE = re.compile(r"[a-zA-Z][a-zA-Z0-9+.-]*://\S+")
+_SECRET_KV_RE = re.compile(r"(?i)\b(password|pwd|apikey|api_key|token|secret)\s*=\s*\S+")
+
+
+def redact_secrets(text: str) -> str:
+    """Strip anything shaped like a URL/URI or a password=/key=-style field, so a raw
+    driver or config exception's text is safe to put in a log line."""
+    return _SECRET_KV_RE.sub("[redacted]", _URL_RE.sub("[redacted]", text))
+
+
+def classify_error(exc: BaseException) -> tuple[str, str]:
+    """(kind, user-safe message) for an exception that escaped answer_question.
+
+    kind is for logs only, never shown to the user: "llm", "config", "database"
+    or "query" (the fallback for anything unrecognised, e.g. a guard/parsing bug).
+    """
+    if isinstance(exc, llm_client.LLMError):
+        return "llm", exc.user_message
+    if isinstance(exc, RuntimeError):
+        return "config", "The app isn't configured correctly — contact the administrator."
+    if isinstance(exc, psycopg.Error):
+        return "database", "A database error occurred — try again."
+    return "query", "I couldn't build a safe query for that — try rephrasing."

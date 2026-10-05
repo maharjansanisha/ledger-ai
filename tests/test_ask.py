@@ -14,10 +14,11 @@ import json
 import os
 from datetime import date, datetime, timedelta, timezone
 
+import psycopg
 import pytest
 from psycopg.conninfo import conninfo_to_dict
 
-from bahikhata import ask, config, db
+from bahikhata import ask, config, db, llm_client
 from bahikhata.schemas import ConfirmedReceipt
 from tests.fakes import FakeClient, server_error
 
@@ -304,3 +305,59 @@ def test_date_ranges_year_ranges_cover_the_full_calendar_year():
     ranges = ask.date_ranges(date(2026, 10, 3))
     assert ranges["this_year"] == (date(2026, 1, 1), date(2026, 12, 31))
     assert ranges["last_year"] == (date(2025, 1, 1), date(2025, 12, 31))
+
+
+# --- classify_error / redact_secrets: TASK-025 error-kind mapping -------------
+#
+# These are for the page's generic try/except around answer_question(), which
+# already turns every failure case it recognises into a QueryResult.message
+# rather than raising (see e.g. test_llm_unavailable_surfaces_a_user_safe_message
+# above). The reproduction for the real bug this fixes: DATABASE_URL_READONLY
+# unset -> config.get_database_url_readonly() raises RuntimeError from inside
+# db.run_readonly_query, before that function's own try/except even starts, so
+# it escapes answer_question entirely.
+
+def test_classify_error_runtime_error_is_config_kind():
+    kind, message = ask.classify_error(RuntimeError("DATABASE_URL_READONLY is not set."))
+    assert kind == "config"
+    assert "DATABASE_URL_READONLY" not in message  # never the exception's own text
+    assert "contact the administrator" in message.lower()
+
+
+def test_classify_error_psycopg_error_is_database_kind():
+    kind, message = ask.classify_error(psycopg.OperationalError("could not connect to server"))
+    assert kind == "database"
+    assert "could not connect" not in message
+    assert "database error" in message.lower()
+
+
+def test_classify_error_llm_error_is_llm_kind_and_reuses_its_user_message():
+    exc = llm_client.LLMError("rate_limit", "Free-tier limit reached — wait a minute and retry.")
+    kind, message = ask.classify_error(exc)
+    assert kind == "llm"
+    assert message == "Free-tier limit reached — wait a minute and retry."
+
+
+def test_classify_error_unrecognised_exception_is_query_kind():
+    kind, message = ask.classify_error(ValueError("something internal and unexpected"))
+    assert kind == "query"
+    assert "something internal" not in message
+    assert "rephrasing" in message.lower()
+
+
+def test_redact_secrets_strips_a_postgres_url_with_credentials():
+    text = "connection failed: postgresql://ledger_reader:S3cr3t@ep-foo.neon.tech/ledger_test"
+    redacted = ask.redact_secrets(text)
+    assert "S3cr3t" not in redacted
+    assert "ep-foo.neon.tech" not in redacted
+    assert redacted == "connection failed: [redacted]"
+
+
+def test_redact_secrets_strips_a_password_key_value_pair():
+    redacted = ask.redact_secrets("conninfo parse error near password=hunter2 host=foo")
+    assert "hunter2" not in redacted
+
+
+def test_redact_secrets_leaves_an_ordinary_message_unchanged():
+    text = "DATABASE_URL_READONLY is not set. See .env.example."
+    assert ask.redact_secrets(text) == text
