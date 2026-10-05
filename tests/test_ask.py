@@ -6,8 +6,10 @@ directly (pure ask.py retry/message logic) or use the REAL guard and executor
 against TEST_DATABASE_URL (Neon "ledger_test"), never the main database,
 skipping with a clear reason if it is unset.
 
-Does not cover the optional result explanation (S2): see ask.py's module
-docstring -- that is TASK-050, deferred per TASKS.md §18.
+Every test that reaches a non-empty result also queues one more FakeClient
+outcome for the optional explanation call (TASK-050), even when that test
+isn't about the explanation itself -- answer_question always attempts it after
+a non-empty result.
 """
 
 import json
@@ -82,6 +84,10 @@ def plan_json(status="ok", sql=None, start=None, end=None, clarification=None) -
         "status": status, "sql": sql, "date_range_start": start, "date_range_end": end,
         "clarification": clarification,
     })
+
+
+def explain_json(text: str) -> str:
+    return json.dumps({"text": text})
 
 
 # --- Input check (no LLM call at all) ----------------------------------------
@@ -160,12 +166,13 @@ def test_money_alias_violation_retries_once_and_then_succeeds(conn):
     client = FakeClient(
         plan_json(sql="SELECT SUM(total_paisa) AS total FROM receipts"),  # money-alias violation
         plan_json(sql="SELECT SUM(total_paisa) AS total_paisa FROM receipts"),  # fixed
+        explain_json(""),  # the planning retry already used this call's one retry; explanation is separate
     )
     result = ask.answer_question("How much did I spend?", TODAY, client=client)
     assert result.message is None
     assert result.formatted_rows == [("Rs 1,250.00",)]
     assert result.sql_executed == "SELECT SUM(total_paisa) AS total_paisa FROM receipts LIMIT 200"
-    assert len(client.calls) == 2
+    assert len(client.calls) == 3
 
 
 def test_money_alias_violation_twice_fails_after_one_retry():
@@ -183,15 +190,18 @@ def test_ok_plan_runs_and_formats_money_and_text_columns(conn):
     """One real end-to-end "ok" pass: real guard, real executor, no retry."""
     seed(conn, date_ad="2026-09-15", total_paisa=125000, category="Food")
     seed(conn, date_ad="2026-09-20", total_paisa=200000, category="Inventory")
-    client = FakeClient(plan_json(
-        sql="SELECT category, SUM(total_paisa) AS total_paisa FROM receipts GROUP BY category ORDER BY category",
-        start="2026-09-01", end="2026-09-30",
-    ))
+    client = FakeClient(
+        plan_json(
+            sql="SELECT category, SUM(total_paisa) AS total_paisa FROM receipts GROUP BY category ORDER BY category",
+            start="2026-09-01", end="2026-09-30",
+        ),
+        explain_json(""),
+    )
     result = ask.answer_question("Spend by category in September", TODAY, client=client)
     assert result.message is None
     assert result.columns == ["category", "total_paisa"]
     assert set(result.formatted_rows) == {("Food", "Rs 1,250.00"), ("Inventory", "Rs 2,000.00")}
-    assert len(client.calls) == 1
+    assert len(client.calls) == 2
 
 
 # --- Database error: exactly one retry ----------------------------------------
@@ -211,11 +221,12 @@ def test_database_error_retries_once_and_then_succeeds(monkeypatch):
     client = FakeClient(
         plan_json(sql="SELECT SUM(total_paisa) AS total_paisa FROM receipts"),
         plan_json(sql="SELECT SUM(total_paisa) AS total_paisa FROM receipts"),
+        explain_json(""),
     )
     result = ask.answer_question("How much did I spend?", TODAY, client=client)
     assert result.message is None
     assert result.formatted_rows == [("Rs 1,250.00",)]
-    assert len(client.calls) == 2
+    assert len(client.calls) == 3
 
 
 def test_database_error_twice_fails_after_one_retry(monkeypatch):
@@ -277,6 +288,107 @@ def test_cache_hit_means_no_second_llm_call():
     second = ask.answer_question("Should I take out a loan?", TODAY, client=client)
     assert first.message == second.message
     assert len(client.calls) == 1  # the second call was served from the on-disk cache
+
+
+# --- Optional explanation (TASK-050, ARCHITECTURE.md §6 "Optional explanation") ----
+
+@requires_test_db
+def test_explanation_shown_when_every_number_matches_the_rows(conn):
+    seed(conn, date_ad="2026-09-15", total_paisa=125000)
+    client = FakeClient(
+        plan_json(sql="SELECT SUM(total_paisa) AS total_paisa FROM receipts", start="2026-09-01", end="2026-09-30"),
+        explain_json("You spent Rs 1,250.00 in September 2026."),
+    )
+    result = ask.answer_question("How much did I spend in September?", TODAY, client=client)
+    assert result.explanation == "You spent Rs 1,250.00 in September 2026."
+    assert len(client.calls) == 2
+
+
+@requires_test_db
+def test_explanation_dropped_when_a_number_does_not_match(conn):
+    seed(conn, date_ad="2026-09-15", total_paisa=125000)
+    client = FakeClient(
+        plan_json(sql="SELECT SUM(total_paisa) AS total_paisa FROM receipts"),
+        explain_json("You spent Rs 1,350.00."),  # wrong by one digit
+    )
+    result = ask.answer_question("How much did I spend?", TODAY, client=client)
+    assert result.explanation is None
+    assert result.formatted_rows == [("Rs 1,250.00",)]  # table is still shown, never blocked
+
+
+@requires_test_db
+def test_explanation_dropped_when_it_fabricates_a_count(conn):
+    seed(conn, date_ad="2026-09-15", total_paisa=125000)
+    client = FakeClient(
+        plan_json(sql="SELECT SUM(total_paisa) AS total_paisa FROM receipts"),
+        explain_json("You spent Rs 1,250.00 across 5 receipts."),  # "5" appears nowhere in the rows
+    )
+    result = ask.answer_question("How much did I spend?", TODAY, client=client)
+    assert result.explanation is None
+
+
+@requires_test_db
+def test_explanation_call_failure_still_shows_the_table(conn):
+    seed(conn, date_ad="2026-09-15", total_paisa=125000)
+    client = FakeClient(
+        plan_json(sql="SELECT SUM(total_paisa) AS total_paisa FROM receipts"),
+        server_error(), server_error(),  # both attempts of the internal 5xx retry fail
+    )
+    result = ask.answer_question("How much did I spend?", TODAY, client=client)
+    assert result.message is None
+    assert result.explanation is None
+    assert result.formatted_rows == [("Rs 1,250.00",)]
+
+
+def test_explanation_never_attempted_on_an_empty_result(monkeypatch):
+    """Only ONE FakeClient outcome is queued: a second call (the explanation) would
+    raise IndexError and fail this test, proving _maybe_explain is never reached."""
+    monkeypatch.setattr(
+        db, "run_readonly_query",
+        lambda sql, url=None: db.QueryExecutionResult(ok=True, columns=["total_paisa"], rows=[(None,)]),
+    )
+    client = FakeClient(plan_json(sql="SELECT SUM(total_paisa) AS total_paisa FROM receipts"))
+    result = ask.answer_question("How much did I spend?", TODAY, client=client)
+    assert result.message == "No matching records."
+    assert len(client.calls) == 1
+
+
+# --- check_explanation_numbers: pure function, no LLM or DB -------------------
+
+def test_numbers_check_passes_when_every_number_is_present():
+    assert ask.check_explanation_numbers(
+        "You spent Rs 1,250.00 across 3 receipts.", [("Rs 1,250.00", 3)], "",
+    )
+
+
+def test_numbers_check_passes_with_comma_formatting_difference():
+    assert ask.check_explanation_numbers("You spent 1250.50 total.", [("Rs 1,250.50",)], "")
+
+
+def test_numbers_check_fails_when_total_is_wrong_by_one_digit():
+    assert not ask.check_explanation_numbers("You spent Rs 1,350.00.", [("Rs 1,250.00",)], "")
+
+
+def test_numbers_check_fails_for_a_fabricated_count():
+    assert not ask.check_explanation_numbers("Across 5 receipts.", [("Rs 1,250.00", 3)], "")
+
+
+def test_numbers_check_fails_for_a_fabricated_number_not_in_rows_or_range():
+    assert not ask.check_explanation_numbers("That's 12% more than last month.", [("Rs 1,250.00",)], "")
+
+
+def test_numbers_check_allows_a_number_that_only_appears_in_the_date_range():
+    assert ask.check_explanation_numbers(
+        "You spent Rs 1,250.00 in 2026.", [("Rs 1,250.00",)], "2026-09-01 to 2026-09-30",
+    )
+
+
+def test_numbers_check_passes_trivially_with_no_numbers_in_the_explanation():
+    assert ask.check_explanation_numbers("No spending stood out.", [("Rs 1,250.00",)], "")
+
+
+def test_numbers_check_handles_an_empty_result_set():
+    assert ask.check_explanation_numbers("", [], "")
 
 
 # --- date_ranges: pure function ------------------------------------------------

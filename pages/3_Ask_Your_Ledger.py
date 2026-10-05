@@ -37,9 +37,9 @@ def render_answer(result: QueryResult) -> None:
         st.caption(f"Assumed date range: {result.plan.date_range_start} to {result.plan.date_range_end}")
 
     if result.formatted_rows:
-        st.dataframe(pd.DataFrame(result.formatted_rows, columns=result.columns), hide_index=True, width="stretch")
         if result.explanation:
             st.write(result.explanation)
+        st.dataframe(pd.DataFrame(result.formatted_rows, columns=result.columns), hide_index=True, width="stretch")
     elif result.message:
         st.info(result.message)
 

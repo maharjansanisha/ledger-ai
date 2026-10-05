@@ -15,10 +15,12 @@ strategy="text_to_sql" is the only strategy implemented. The parameter exists
 now so a future "functions" fallback (ARCHITECTURE.md §6, designed but not
 built) can plug into the same signature without changing the UI or eval.
 
-The optional result explanation (S2) is TASK-050, a P1 "SHOULD" item that
-TASKS.md §18 says not to start before the end-of-Sunday (query slice) checkpoint
-passes -- so QueryResult.explanation is always None here; it is not produced by
-this module yet.
+The optional result explanation (ARCHITECTURE.md §6 "Optional explanation", S2,
+TASK-050) is one more, non-retried LLM call made only after a non-empty result:
+it receives the question and the formatted rows, never writes SQL and never
+computes anything. check_explanation_numbers() -- a pure function, independent
+of the LLM -- drops it if any number in it doesn't already appear in the rows
+or the shown date range; the table is never blocked on it.
 
 classify_error() and redact_secrets() are for the page's generic try/except
 around answer_question() -- not for anything inside this module, which already
@@ -30,7 +32,7 @@ import re
 from datetime import date, timedelta
 
 import psycopg
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from bahikhata import config, db, llm_client, sql_guard
 from bahikhata.normalize import format_npr
@@ -141,6 +143,70 @@ def _format_rows(columns: list[str], rows: list[tuple]) -> list[tuple]:
     ]
 
 
+_NUMBER_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def _numbers_in(text: str) -> set[str]:
+    """Numeric tokens in `text`, with grouping commas stripped so "1,250.50" and "1250.50"
+    compare equal. Each token keeps its own decimal places, so "1250" and "1250.50" are
+    deliberately treated as different numbers."""
+    return {match.replace(",", "") for match in _NUMBER_RE.findall(text)}
+
+
+def check_explanation_numbers(explanation: str, formatted_rows: list[tuple], date_range_text: str = "") -> bool:
+    """True if every number in `explanation` already appears in the formatted rows or the
+    date range (ARCHITECTURE.md §6 "Optional explanation"). Pure function, no LLM or DB.
+
+    formatted_rows must already be the *_paisa -> "Rs ..." display strings (see
+    _format_rows): checking against raw paisa integers would let a 100x display
+    error (rupees vs paisa) slip through unnoticed. A plain count (e.g. from
+    COUNT(*)) is just an int cell and compares the same way.
+    """
+    allowed = _numbers_in(date_range_text)
+    for row in formatted_rows:
+        for cell in row:
+            if cell is not None:
+                allowed |= _numbers_in(str(cell))
+    return _numbers_in(explanation) <= allowed
+
+
+class _Explanation(BaseModel):
+    """llm_client always requests JSON (A§3.4); this is the schema for the one-sentence answer."""
+
+    text: str
+
+
+def _maybe_explain(question: str, plan: QueryPlan, formatted_rows: list[tuple], *, client=None) -> str | None:
+    """One optional, non-retried LLM call (ARCHITECTURE.md §6 "Optional explanation").
+
+    Returns None (table shown alone) if the call fails, the response doesn't
+    parse, or any number in it fails check_explanation_numbers. Called only
+    after a non-empty result, so an empty result never reaches this at all.
+    """
+    date_range_text = ""
+    if plan.date_range_start and plan.date_range_end:
+        date_range_text = f"{plan.date_range_start} to {plan.date_range_end}"
+    rows_text = "\n".join(", ".join(str(v) for v in row) for row in formatted_rows)
+    prompt = (
+        llm_client.load_prompt(config.EXPLANATION_PROMPT)
+        .replace("{question}", question)
+        .replace("{date_range}", date_range_text or "(none)")
+        .replace("{rows}", rows_text)
+    )
+    cache_input = f"{question}\x1f{date_range_text}\x1f{rows_text}"
+    try:
+        response = llm_client.call_json(
+            prompt, namespace="explain", prompt_version=config.EXPLANATION_PROMPT,
+            cache_input=cache_input, response_schema=_Explanation, client=client,
+        )
+        explanation = _Explanation.model_validate_json(response.text).text.strip()
+    except (llm_client.LLMError, ValidationError):
+        return None
+    if not explanation or not check_explanation_numbers(explanation, formatted_rows, date_range_text):
+        return None
+    return explanation
+
+
 def answer_question(question: str, today: date, *, strategy: str = "text_to_sql", client=None) -> QueryResult:
     """question + today -> QueryResult. The single entry point for the UI and eval.
 
@@ -209,9 +275,11 @@ def answer_question(question: str, today: date, *, strategy: str = "text_to_sql"
         )
 
     formatted_rows = _format_rows(exec_result.columns, exec_result.rows)
+    explanation = _maybe_explain(stripped, plan, formatted_rows, client=client)
     return QueryResult(
         **base, plan=plan, sql_executed=guard_result.sql_to_run,
         columns=exec_result.columns, rows=exec_result.rows, formatted_rows=formatted_rows,
+        explanation=explanation,
     )
 
 

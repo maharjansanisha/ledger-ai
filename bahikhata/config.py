@@ -38,7 +38,7 @@ LLM_RETRY_WAIT_SECONDS = 2               # one automatic retry on 5xx/timeout; n
 # Never edit a version after it has been used in a test-split run; copy to _v2.
 EXTRACTION_PROMPT = "extraction_v1"
 SQL_PROMPT = "sql_v1"
-EXPLANATION_PROMPT = "explanation_v1"
+EXPLANATION_PROMPT = "explain_v1"
 
 # --- Image intake (ARCHITECTURE.md §3.2-3.3) --------------------------------
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024       # 10 MB

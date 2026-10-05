@@ -60,7 +60,7 @@ def test_answer_with_rows_shows_table_and_sql_expander(monkeypatch):
     assert "LIMIT 200" in at.expander[0].code[0].value
 
 
-def test_explanation_shown_under_the_table_when_present(monkeypatch):
+def test_explanation_shown_above_the_table_when_present(monkeypatch):
     plan = QueryPlan(status="ok", sql="SELECT SUM(total_paisa) AS total_paisa FROM receipts")
     result = QueryResult(
         question="x", plan=plan, sql_executed="SELECT SUM(total_paisa) AS total_paisa FROM receipts LIMIT 200",
@@ -71,6 +71,11 @@ def test_explanation_shown_under_the_table_when_present(monkeypatch):
     at = ask_question(at, "How much did I spend?")
     assert not at.exception
     assert "You spent Rs 1,250.00." in "\n".join(m.value for m in at.markdown)
+    assert len(at.dataframe) == 1  # table is still shown alongside the sentence
+
+    assistant_bubble = at.chat_message[1]  # user bubble, then assistant bubble
+    child_types = [type(child).__name__ for child in assistant_bubble.children.values()]
+    assert child_types.index("Markdown") < child_types.index("Dataframe")
 
 
 def test_refused_unsafe_sql_shows_message_and_sql_not_run_expander(monkeypatch):
