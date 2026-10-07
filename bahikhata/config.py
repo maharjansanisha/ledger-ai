@@ -64,6 +64,21 @@ QUERY_ALLOWED_TABLES = ("receipts", "line_items")
 SQL_ROW_LIMIT = 200
 MAX_QUESTION_CHARS = 500
 READONLY_STATEMENT_TIMEOUT_MS = 5000  # Amendment A1: statement_timeout=5s
+READONLY_ROLE = "ledger_reader"  # the only role Ask Your Ledger may connect as
+
+# --- Ask Your Ledger: documents (hybrid RAG over chat-attached files) -------
+# The Pinecone index uses integrated embedding: Pinecone embeds the text, so no
+# embedding model is configured here. Ledger numbers still come only from SQL.
+RAG_DIR = DATA_DIR / "rag"                # manifest of indexed documents (gitignored)
+RAG_NAMESPACE: str = os.getenv("PINECONE_NAMESPACE", "").strip() or "ask-uploads"
+RAG_CHUNK_CHARS = 1200                    # ~300 tokens: within any Pinecone-hosted model's input limit
+RAG_CHUNK_OVERLAP = 150
+RAG_UPSERT_BATCH = 96                     # Pinecone's per-request limit for integrated embedding
+RAG_TOP_K = 5
+RAG_MIN_SCORE = 0.3                       # hits below this are treated as irrelevant
+RAG_SNIPPET_CHARS = 240                   # shown in the "Sources" expander
+ROUTE_PROMPT = "route_v1"
+ANSWER_PROMPT = "answer_v1"
 
 
 def get_gemini_api_key() -> str:
@@ -105,6 +120,18 @@ def get_database_url_readonly() -> str:
             "Amendment A1 / TASK-005: create the ledger_reader role in the Neon SQL editor, "
             "grant it SELECT on receipts and line_items, then add its connection string here."
         )
+    from psycopg.conninfo import conninfo_to_dict  # local: keep config importable without psycopg
+
+    try:
+        user = conninfo_to_dict(url).get("user") or ""
+    except Exception:  # malformed URL; never echo it (it holds the password)
+        user = ""
+    if user != READONLY_ROLE:
+        raise RuntimeError(
+            f"DATABASE_URL_READONLY must connect as {READONLY_ROLE!r}, not the owner or any other "
+            "role: that role's SELECT-only grant on receipts and line_items is one of Ask Your "
+            "Ledger's two independent locks (Amendment A1)."
+        )
     return url
 
 
@@ -112,6 +139,32 @@ def has_gemini_api_key() -> bool:
     """True if a (non-placeholder) key is configured. Safe to show in the UI."""
     try:
         get_gemini_api_key()
+        return True
+    except RuntimeError:
+        return False
+
+
+def get_pinecone_api_key() -> str:
+    """Return PINECONE_API_KEY. Read lazily, like the Gemini key. Never print or log it."""
+    key = os.getenv("PINECONE_API_KEY", "").strip()
+    if not key or "<" in key:
+        raise RuntimeError("PINECONE_API_KEY is not set. See .env.example.")
+    return key
+
+
+def get_pinecone_index() -> str:
+    """Return PINECONE_INDEX, the name of an existing integrated-embedding index."""
+    name = os.getenv("PINECONE_INDEX", "").strip()
+    if not name or "<" in name:
+        raise RuntimeError("PINECONE_INDEX is not set. See .env.example.")
+    return name
+
+
+def has_rag_config() -> bool:
+    """True if Pinecone is configured, so attachments can be indexed and searched."""
+    try:
+        get_pinecone_api_key()
+        get_pinecone_index()
         return True
     except RuntimeError:
         return False

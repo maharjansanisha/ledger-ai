@@ -212,6 +212,37 @@ def test_list_receipts_newest_first_with_limit(conn):
     assert rows[0]["total_paisa"] == 125000
 
 
+@requires_test_db
+def test_update_replaces_values_and_line_items_keeps_image_and_ai_audit(conn):
+    receipt_id = db.save_confirmed_receipt(
+        conn, ConfirmedReceipt.model_validate(FULL), "data/images/abc.jpg", make_audit())
+    edited = ConfirmedReceipt.model_validate({
+        **FULL, "merchant_name": "Shree Traders Pvt", "status": "clean", "user_override": False,
+        "line_items": [{"description": "Rice", "quantity": "1", "unit_price_paisa": 125000, "amount_paisa": 125000}],
+    })
+    later = datetime(2026, 10, 5, 9, 0, tzinfo=timezone.utc)
+    db.update_confirmed_receipt(conn, receipt_id, edited, flags_at_save=[],
+                                edited_fields=["merchant_name", "line_items"], confirmed_at=later)
+
+    saved = db.get_receipt(conn, receipt_id)
+    assert saved["merchant_name"] == "Shree Traders Pvt" and saved["status"] == "clean"
+    assert saved["image_path"] == "data/images/abc.jpg"
+    assert [i["description"] for i in saved["line_items"]] == ["Rice"]
+    assert db.get_ai_draft_json(conn, receipt_id) == {"total_paisa": 125000}
+    audit = conn.execute("SELECT edited_fields_json, confirmed_at, raw_response FROM receipt_audit"
+                         " WHERE receipt_id = %s", (receipt_id,)).fetchone()
+    assert audit == (["merchant_name", "line_items"], later, '{"total_raw": "1,250.00"}')
+    assert count_rows(conn) == {"receipts": 1, "line_items": 1, "receipt_audit": 1}
+
+
+@requires_test_db
+def test_update_missing_receipt_raises_and_changes_nothing(conn):
+    with pytest.raises(LookupError):
+        db.update_confirmed_receipt(conn, 999999, ConfirmedReceipt.model_validate(MINIMAL),
+                                    flags_at_save=[], edited_fields=[], confirmed_at=NOW)
+    assert count_rows(conn) == {"receipts": 0, "line_items": 0, "receipt_audit": 0}
+
+
 # --- TASK-020: dashboard period math (no database needed) --------------------
 
 @pytest.mark.parametrize("day, expected", [

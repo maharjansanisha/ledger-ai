@@ -7,16 +7,25 @@ already covers. No network, no database.
 """
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import psycopg
+import pytest
 from streamlit.testing.v1 import AppTest
 
-from bahikhata import ask, config, llm_client
-from bahikhata.schemas import QueryPlan, QueryResult
+from bahikhata import ask, config, llm_client, rag
+from bahikhata.schemas import QueryPlan, QueryResult, Source
+from pages.ask_your_ledger import views
 
-PAGE = str(Path(__file__).resolve().parent.parent / "pages" / "3_Ask_Your_Ledger.py")
+PAGE = str(Path(__file__).resolve().parent.parent / "pages" / "ask_your_ledger" / "page.py")
 
 BASE = {"prompt_version": config.SQL_PROMPT, "model_name": config.MODEL_NAME}
+
+
+@pytest.fixture(autouse=True)
+def no_rag(monkeypatch):
+    """Hermetic by default: behave as if Pinecone isn't configured, whatever .env says."""
+    monkeypatch.setattr(config, "has_rag_config", lambda: False)
 
 
 def start(monkeypatch, outcomes: dict[str, QueryResult]) -> AppTest:
@@ -163,4 +172,65 @@ def test_no_conversation_memory_each_question_answered_independently(monkeypatch
     at = ask_question(at, "first question")
     at = ask_question(at, "second question")
     assert [c[0] for c in seen_calls] == ["first question", "second question"]
-    assert all(kw == {} for _question, kw in seen_calls)  # no history/context argument is passed
+    assert all(kw == {"strategy": "hybrid"} for _question, kw in seen_calls)  # no history/context argument
+
+
+# --- Documents (hybrid RAG) ----------------------------------------------------
+
+def test_without_rag_config_the_page_says_attachments_are_not_searchable(monkeypatch):
+    at = start(monkeypatch, {})
+    assert not at.exception
+    assert any("isn't configured" in c.value for c in at.caption)
+    assert len(at.sidebar.button) == 0
+
+
+def test_document_answer_and_sources_expander(monkeypatch):
+    result = QueryResult(
+        question="x", route="docs", answer="Your monthly transport budget is Rs 5,000.",
+        sources=[Source(doc_name="budget.pdf", chunk_id="abc#0", score=0.82, snippet="Monthly transport budget...")],
+        **BASE,
+    )
+    at = start(monkeypatch, {"What is my transport budget?": result})
+    at = ask_question(at, "What is my transport budget?")
+    assert not at.exception
+    assert "Your monthly transport budget is Rs 5,000." in "\n".join(m.value for m in at.markdown)
+    labels = [e.label for e in at.expander]
+    assert "Sources (1)" in labels and "SQL" not in labels
+    assert any("budget.pdf" in m.value for m in at.markdown)
+
+
+def test_attached_files_show_their_index_status(monkeypatch):
+    monkeypatch.setattr(config, "has_rag_config", lambda: True)
+    monkeypatch.setattr(rag, "list_documents", lambda: [])
+    outcomes = {"budget.pdf": rag.IngestResult("budget.pdf", "indexed", 3),
+                "scan.pdf": rag.IngestResult("scan.pdf", "failed", message="That file has no extractable text.")}
+    monkeypatch.setattr(rag, "ingest", lambda name, data: outcomes[name])
+    files = [SimpleNamespace(name=n, getvalue=lambda: b"x") for n in outcomes]
+    monkeypatch.setattr(views, "render_chat_input", lambda: SimpleNamespace(text="", files=files))
+    at = AppTest.from_file(PAGE, default_timeout=30)
+    at.run()
+    assert not at.exception
+    captions = "\n".join(c.value for c in at.caption)
+    assert "budget.pdf — indexed (3 chunks)" in captions
+    assert "scan.pdf — That file has no extractable text." in captions
+    assert [m.name for m in at.chat_message] == ["user"]  # no question, so no answer
+
+
+def test_sidebar_lists_documents_and_deletes_one(monkeypatch):
+    monkeypatch.setattr(config, "has_rag_config", lambda: True)
+    docs = [{"doc_id": "d1", "name": "budget.pdf", "chunks": 3, "size": 10, "added_at": "2026-10-07"}]
+    deleted = []
+
+    def fake_delete(doc_id):
+        deleted.append(doc_id)
+        docs.clear()
+
+    monkeypatch.setattr(rag, "list_documents", lambda: list(docs))
+    monkeypatch.setattr(rag, "delete_document", fake_delete)
+    at = AppTest.from_file(PAGE, default_timeout=30)
+    at.run()
+    assert any("budget.pdf · 3 chunks" in c.value for c in at.sidebar.caption)
+    at = at.sidebar.button[0].click().run()
+    assert not at.exception
+    assert deleted == ["d1"]
+    assert any("None yet" in c.value for c in at.sidebar.caption)

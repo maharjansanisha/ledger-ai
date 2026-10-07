@@ -25,6 +25,7 @@ from bahikhata.schemas import ConfirmedReceipt
 from tests.fakes import FakeClient, server_error
 
 TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "").strip()
+_REAL_GET_DATABASE_URL_READONLY = config.get_database_url_readonly  # before env() patches it
 TODAY = date(2026, 10, 3)
 
 requires_test_db = pytest.mark.skipif(
@@ -257,6 +258,34 @@ def test_a_retry_whose_sql_is_unsafe_is_refused_not_executed(monkeypatch):
     assert len(client.calls) == 2
 
 
+def test_database_unreachable_is_reported_without_an_llm_retry(monkeypatch):
+    monkeypatch.setattr(
+        db, "run_readonly_query",
+        lambda sql, url=None: db.QueryExecutionResult(
+            ok=False, error="Couldn't connect to the database.", connection_failed=True,
+        ),
+    )
+    client = FakeClient(plan_json(sql="SELECT SUM(total_paisa) AS total_paisa FROM receipts"))
+    result = ask.answer_question("How much did I spend?", TODAY, client=client)
+    assert "couldn't reach" in result.message
+    assert result.sql_executed is None  # never ran, so the page labels it "SQL (not run)"
+    assert len(client.calls) == 1
+
+
+def test_database_unreachable_on_the_retry_is_also_reported(monkeypatch):
+    attempts = iter([
+        db.QueryExecutionResult(ok=False, error="The database could not run that query."),
+        db.QueryExecutionResult(ok=False, error="Couldn't connect to the database.", connection_failed=True),
+    ])
+    monkeypatch.setattr(db, "run_readonly_query", lambda sql, url=None: next(attempts))
+    client = FakeClient(
+        plan_json(sql="SELECT SUM(total_paisa) AS total_paisa FROM receipts"),
+        plan_json(sql="SELECT SUM(total_paisa) AS total_paisa FROM receipts"),
+    )
+    result = ask.answer_question("How much did I spend?", TODAY, client=client)
+    assert "couldn't reach" in result.message
+
+
 # --- Empty result --------------------------------------------------------------
 
 def test_sum_over_zero_matching_rows_is_no_matching_records(monkeypatch):
@@ -473,3 +502,22 @@ def test_redact_secrets_strips_a_password_key_value_pair():
 def test_redact_secrets_leaves_an_ordinary_message_unchanged():
     text = "DATABASE_URL_READONLY is not set. See .env.example."
     assert ask.redact_secrets(text) == text
+
+
+# --- DATABASE_URL_READONLY must be the ledger_reader role -----------------------
+
+@pytest.mark.parametrize("url", [
+    "postgresql://neondb_owner:pw@ep-x-pooler.neon.tech/neondb?sslmode=require",
+    "postgresql://ep-x.neon.tech/neondb",            # no user at all
+])
+def test_readonly_url_as_any_other_role_is_refused(monkeypatch, url):
+    monkeypatch.setenv("DATABASE_URL_READONLY", url)
+    with pytest.raises(RuntimeError) as excinfo:
+        _REAL_GET_DATABASE_URL_READONLY()
+    assert "pw" not in str(excinfo.value)  # never echoes the URL or its password
+
+
+def test_readonly_url_as_ledger_reader_is_accepted(monkeypatch):
+    url = "postgresql://ledger_reader:pw@ep-x.neon.tech/neondb?sslmode=require"
+    monkeypatch.setenv("DATABASE_URL_READONLY", url)
+    assert _REAL_GET_DATABASE_URL_READONLY() == url

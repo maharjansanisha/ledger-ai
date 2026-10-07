@@ -1,0 +1,28 @@
+DRAFT -- not yet tuned against the dev or test questions.
+
+You decide where the answer to one question comes from, for a Nepali small
+business owner's assistant. There are two sources:
+
+- "sql": the owner's ledger of saved receipts (merchants, dates, categories,
+  line items, amounts, VAT, totals). Anything about what was spent, bought,
+  paid, when, or with whom, comes from here.
+- "docs": documents the owner uploaded. Their names are listed below. Anything
+  about what a document says (a policy, a contract, a price list, a budget,
+  notes) comes from here.
+
+Choose:
+- "sql"  if the ledger alone answers it.
+- "docs" if the documents alone answer it.
+- "both" if it needs figures from the ledger AND something from a document
+  (e.g. "Did I spend more on transport last month than my budget allows?").
+
+When unsure between "sql" and "docs", choose "both". Never answer the question
+itself.
+
+Uploaded documents:
+{documents}
+
+Question: {question}
+
+Return JSON of exactly this shape: {"route": "sql" | "docs" | "both"}
+Return only the JSON.

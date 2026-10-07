@@ -11,9 +11,14 @@ guard rejection for a *format* reason (syntax error, money-alias rule) or a
 database error -- never for an unsafe query, and never more than once per
 question. Out-of-scope and ambiguous plans stop before any SQL is built.
 
-strategy="text_to_sql" is the only strategy implemented. The parameter exists
-now so a future "functions" fallback (ARCHITECTURE.md §6, designed but not
-built) can plug into the same signature without changing the UI or eval.
+strategy="text_to_sql" answers from the ledger only. strategy="hybrid" adds
+the documents attached in the chat (rag.py): one router call picks "sql",
+"docs" or "both"; document answers come from one more call over the retrieved
+chunks (and the SQL rows, for "both"). Hybrid falls straight through to
+text_to_sql -- no router call -- when Pinecone isn't configured or nothing is
+indexed. Ledger figures still come only from SQL rows: check_answer_numbers()
+drops a document answer containing a number that is in neither the rows, the
+date range nor the excerpts it cites.
 
 The optional result explanation (ARCHITECTURE.md §6 "Optional explanation", S2,
 TASK-050) is one more, non-retried LLM call made only after a non-empty result:
@@ -29,20 +34,25 @@ raising (TASK-025: distinguish Ask error kinds).
 """
 
 import re
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
+from typing import Literal
 
 import psycopg
 from pydantic import BaseModel, ValidationError
 
-from bahikhata import config, db, llm_client, sql_guard
+from bahikhata import config, db, llm_client, rag, sql_guard
 from bahikhata.normalize import format_npr
-from bahikhata.schemas import QueryPlan, QueryResult
+from bahikhata.schemas import QueryPlan, QueryResult, Source
 
 _REFUSED_UNSAFE = "This request isn't allowed. I can only read your ledger."
 _OUT_OF_SCOPE = "I can only answer questions about your saved receipts."
 _NO_MATCH = "No matching records."
 _COULD_NOT_BUILD = "I couldn't build a valid query — try rephrasing."
 _GENERIC_CLARIFICATION = "Could you rephrase that? I wasn't sure what you meant."
+_DB_UNREACHABLE = "I couldn't reach your ledger database right now — please try again shortly."
+_NO_RELEVANT_DOCS = "I couldn't find anything relevant in your uploaded documents."
+_NO_RELIABLE_ANSWER = "I found related passages but couldn't write a reliable answer — see the sources below."
 
 
 def today() -> date:
@@ -213,6 +223,8 @@ def answer_question(question: str, today: date, *, strategy: str = "text_to_sql"
     Never raises for a bad question, an unsafe query, or a provider/database
     failure: every one of those comes back as `message`, not an exception.
     """
+    if strategy == "hybrid":
+        return _answer_hybrid(question, today, client=client)
     if strategy != "text_to_sql":
         raise NotImplementedError(
             f"strategy={strategy!r} is not implemented (ARCHITECTURE.md §6: designed, not built)."
@@ -254,6 +266,11 @@ def answer_question(question: str, today: date, *, strategy: str = "text_to_sql"
         message = _REFUSED_UNSAFE if not guard_result.retryable else _COULD_NOT_BUILD
         return QueryResult(**base, plan=plan, message=message)
 
+    if exec_result is not None and exec_result.connection_failed:
+        # The SQL never reached the database: retrying the LLM can't fix this, and
+        # "try rephrasing" would send the user chasing the wrong problem.
+        return QueryResult(**base, plan=plan, message=_DB_UNREACHABLE)
+
     if not retried and exec_result is not None and not exec_result.ok:
         retry_plan, _ = _get_plan(
             stripped, today,
@@ -265,9 +282,11 @@ def answer_question(question: str, today: date, *, strategy: str = "text_to_sql"
             if not guard_result.ok:
                 message = _REFUSED_UNSAFE if not guard_result.retryable else _COULD_NOT_BUILD
                 return QueryResult(**base, plan=plan, message=message)
+            if exec_result is not None and exec_result.connection_failed:
+                return QueryResult(**base, plan=plan, message=_DB_UNREACHABLE)
 
     if exec_result is None or not exec_result.ok:
-        return QueryResult(**base, plan=plan, sql_executed=guard_result.sql_to_run, message=_COULD_NOT_BUILD)
+        return QueryResult(**base, plan=plan, message=_COULD_NOT_BUILD)
 
     if _is_empty_result(exec_result.rows):
         return QueryResult(
@@ -280,6 +299,137 @@ def answer_question(question: str, today: date, *, strategy: str = "text_to_sql"
         **base, plan=plan, sql_executed=guard_result.sql_to_run,
         columns=exec_result.columns, rows=exec_result.rows, formatted_rows=formatted_rows,
         explanation=explanation,
+    )
+
+
+# --- Hybrid: ledger + uploaded documents ----------------------------------------
+
+class _Route(BaseModel):
+    route: Literal["sql", "docs", "both"]
+
+
+class _Answer(BaseModel):
+    answer: str
+    cited: list[int] = []
+
+
+def check_answer_numbers(answer: str, formatted_rows: list[tuple], context_texts: list[str]) -> bool:
+    """check_explanation_numbers, widened for document answers: every number in `answer`
+    must appear in the formatted rows or in one of `context_texts` (date range, cited
+    excerpts, excerpt numbers). Pure function, no LLM or DB."""
+    return check_explanation_numbers(answer, formatted_rows, "\n".join(context_texts))
+
+
+def _route(question: str, doc_names: list[str], *, client=None) -> str:
+    """One LLM call -> "sql" | "docs" | "both". Falls back to "sql" (today's behaviour) on
+    any failure; if the provider is down, the SQL path then reports that itself."""
+    documents = "\n".join(f"- {name}" for name in doc_names)
+    prompt = (
+        llm_client.load_prompt(config.ROUTE_PROMPT)
+        .replace("{documents}", documents)
+        .replace("{question}", question)
+    )
+    try:
+        response = llm_client.call_json(
+            prompt, namespace="route", prompt_version=config.ROUTE_PROMPT,
+            cache_input=f"{question}\x1f{documents}", response_schema=_Route, client=client,
+        )
+        return _Route.model_validate_json(response.text).route
+    except (llm_client.LLMError, ValidationError):
+        return "sql"
+
+
+def _snippet(text: str) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= config.RAG_SNIPPET_CHARS else text[: config.RAG_SNIPPET_CHARS - 1] + "…"
+
+
+def _sources(chunks: list[rag.Chunk]) -> list[Source]:
+    return [Source(doc_name=c.doc_name, chunk_id=c.id, score=round(c.score, 3), snippet=_snippet(c.text)) for c in chunks]
+
+
+def _synthesize(
+    question: str, chunks: list[rag.Chunk], sql_result: QueryResult | None, *, client=None,
+) -> tuple[str | None, list[rag.Chunk]]:
+    """One non-retried LLM call over the excerpts (and rows) -> (answer or None, cited chunks).
+
+    The answer is None if the call fails, doesn't parse, or check_answer_numbers fails;
+    the cited chunks fall back to all chunks when the model cites none (or bad numbers).
+    """
+    excerpts = "\n\n".join(f"[{n}] ({c.doc_name})\n{c.text}" for n, c in enumerate(chunks, start=1))
+    date_range_text, formatted_rows, rows_text = "", [], "(none)"
+    if sql_result is not None:
+        plan = sql_result.plan
+        if plan is not None and plan.date_range_start and plan.date_range_end:
+            date_range_text = f"{plan.date_range_start} to {plan.date_range_end}"
+        if sql_result.formatted_rows:
+            formatted_rows = sql_result.formatted_rows
+            rows_text = "\n".join(
+                [", ".join(sql_result.columns)] + [", ".join(str(v) for v in row) for row in formatted_rows]
+            )
+    prompt = (
+        llm_client.load_prompt(config.ANSWER_PROMPT)
+        .replace("{excerpts}", excerpts)
+        .replace("{date_range}", date_range_text or "(none)")
+        .replace("{rows}", rows_text)
+        .replace("{question}", question)
+    )
+    cache_input = "\x1f".join([question, ",".join(c.id for c in chunks), date_range_text, rows_text])
+    try:
+        response = llm_client.call_json(
+            prompt, namespace="answer", prompt_version=config.ANSWER_PROMPT,
+            cache_input=cache_input, response_schema=_Answer, client=client,
+        )
+        parsed = _Answer.model_validate_json(response.text)
+    except (llm_client.LLMError, ValidationError):
+        return None, chunks
+    cited = [chunks[n - 1] for n in dict.fromkeys(parsed.cited) if 1 <= n <= len(chunks)] or chunks
+    answer = parsed.answer.strip()
+    context = [date_range_text, " ".join(str(n) for n in range(1, len(chunks) + 1))] + [c.text for c in cited]
+    if not answer or not check_answer_numbers(answer, formatted_rows, context):
+        return None, cited
+    return answer, cited
+
+
+def _answer_hybrid(question: str, today: date, *, client=None) -> QueryResult:
+    stripped = question.strip()
+    if (
+        not stripped or len(question) > config.MAX_QUESTION_CHARS
+        or not config.has_rag_config() or not rag.has_documents()
+    ):
+        return answer_question(question, today, client=client)  # input checks live there
+
+    route = _route(stripped, [d["name"] for d in rag.list_documents()], client=client)
+    if route == "sql":
+        return answer_question(question, today, client=client).model_copy(update={"route": "sql"})
+
+    sql_result, doc_error, chunks = None, None, []
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        search = pool.submit(rag.search, stripped)
+        if route == "both":
+            sql_result = answer_question(question, today, client=client)
+        try:
+            chunks = search.result()
+        except rag.RagError as exc:
+            doc_error = exc.user_message
+
+    if route == "both":
+        update = {"route": "both"}
+        if doc_error:
+            update["message"] = sql_result.message or doc_error
+        if chunks:
+            answer, cited = _synthesize(stripped, chunks, sql_result, client=client)
+            update.update(answer=answer, sources=_sources(cited))
+        return sql_result.model_copy(update=update)
+
+    base = {"question": question, "route": "docs", "prompt_version": config.ANSWER_PROMPT, "model_name": config.MODEL_NAME}
+    if doc_error:
+        return QueryResult(**base, message=doc_error)
+    if not chunks:
+        return QueryResult(**base, message=_NO_RELEVANT_DOCS)
+    answer, cited = _synthesize(stripped, chunks, None, client=client)
+    return QueryResult(
+        **base, answer=answer, sources=_sources(cited), message=None if answer else _NO_RELIABLE_ANSWER,
     )
 
 
@@ -307,11 +457,13 @@ def redact_secrets(text: str) -> str:
 def classify_error(exc: BaseException) -> tuple[str, str]:
     """(kind, user-safe message) for an exception that escaped answer_question.
 
-    kind is for logs only, never shown to the user: "llm", "config", "database"
-    or "query" (the fallback for anything unrecognised, e.g. a guard/parsing bug).
+    kind is for logs only, never shown to the user: "llm", "documents", "config",
+    "database" or "query" (the fallback for anything unrecognised, e.g. a guard/parsing bug).
     """
     if isinstance(exc, llm_client.LLMError):
         return "llm", exc.user_message
+    if isinstance(exc, rag.RagError):
+        return "documents", exc.user_message
     if isinstance(exc, RuntimeError):
         return "config", "The app isn't configured correctly — contact the administrator."
     if isinstance(exc, psycopg.Error):

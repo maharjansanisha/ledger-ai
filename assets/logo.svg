@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="210" height="40" viewBox="0 0 210 40">
+  <rect x="2" y="4" width="30" height="32" rx="7" fill="#0F766E"/>
+  <path d="M10 13h14M10 19h14M10 25h9" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/>
+  <circle cx="25" cy="27" r="3.2" fill="#F59E0B"/>
+  <text x="42" y="27" font-family="'Plus Jakarta Sans', Inter, sans-serif" font-size="19" font-weight="800" fill="#1F2933">BahiKhata<tspan fill="#0F766E"> AI</tspan></text>
+</svg>

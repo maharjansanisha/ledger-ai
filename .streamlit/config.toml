@@ -1,0 +1,22 @@
+# Visual theme for the BahiKhata AI Streamlit app.
+[theme]
+base = "light"
+primaryColor = "#0F766E"
+backgroundColor = "#F6F7F9"
+secondaryBackgroundColor = "#FFFFFF"
+textColor = "#1F2933"
+borderColor = "#E3E7EC"
+dataframeBorderColor = "#E3E7EC"
+dataframeHeaderBackgroundColor = "#F1F4F6"
+showWidgetBorder = true
+baseRadius = "0.6rem"
+buttonRadius = "0.5rem"
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "'Plus Jakarta Sans':https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@600;700;800&display=swap"
+headingFontWeights = [800, 700, 700, 600, 600, 600]
+headingFontSizes = ["2.25rem", "1.5rem", "1.25rem", "1.1rem", "1rem", "0.9rem"]
+metricValueFontWeight = 700
+chartCategoricalColors = ["#0F766E", "#F59E0B", "#6366F1", "#EC4899", "#0EA5E9", "#84CC16", "#A855F7", "#EF4444"]
+
+[server]
+maxUploadSize=10

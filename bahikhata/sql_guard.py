@@ -11,9 +11,12 @@ Checks, in order (sqlglot, postgres dialect, per Amendment A1):
 3. The root must be a SELECT (a WITH ... SELECT is allowed); no SELECT INTO, no FOR UPDATE/SHARE.
 4. No Insert/Update/Delete/Drop/Create/Alter/Pragma/Command/Set/Copy/Truncate/Merge/Grant/Revoke
    node anywhere in the tree (catches e.g. a DELETE hidden inside a CTE).
-5. Every table referenced is receipts, line_items, or a CTE defined in the same query;
-   pg_catalog/information_schema are always rejected regardless of table name.
-6. No pg_*-prefixed function (pg_sleep, pg_read_file, ...) or other file/network/LO function.
+5. Every table referenced is receipts, line_items, or a CTE defined in the same query, and
+   any schema qualifier must be `public` (so pg_catalog, information_schema or any other
+   schema is rejected regardless of table name).
+6. No pg_*-prefixed function (pg_sleep, pg_read_file, ...), no file/network/LO function, no
+   function that runs a SQL string of its own (query_to_xml, ...) and so would slip past
+   check 5, and no session-settings function (set_config, current_setting).
 7. Money-alias rule: any output column (in any SELECT in the tree, including subqueries)
    that reads a `*_paisa` column must itself be named with a `*_paisa`-ending alias.
 8. LIMIT 200 is added if missing, and any larger LIMIT is capped to 200.
@@ -30,7 +33,7 @@ DIALECT = "postgres"
 ROW_LIMIT = config.SQL_ROW_LIMIT  # 200
 
 _ALLOWED_TABLES = frozenset(name.lower() for name in config.QUERY_ALLOWED_TABLES)
-_FORBIDDEN_SCHEMAS = frozenset({"pg_catalog", "information_schema"})
+_ALLOWED_SCHEMAS = frozenset({"", "public"})
 
 # Statement-level nodes that are never allowed, anywhere in the tree (not just
 # at the root) -- this is what catches "WITH x AS (DELETE ... ) SELECT * FROM x".
@@ -46,6 +49,15 @@ _FORBIDDEN_FUNCTION_NAMES = frozenset({
     "dblink", "dblink_connect", "dblink_connect_u", "dblink_exec",
     "lo_import", "lo_export", "lo_read", "lo_write", "lo_open", "lo_create",
     "copy_from_program", "copy_to_program",
+    # Run a SQL string (or dump a whole table/schema) inside a SELECT -- the guard
+    # can't see the tables named inside that string.
+    "query_to_xml", "query_to_xml_and_xmlschema", "query_to_xmlschema",
+    "table_to_xml", "table_to_xml_and_xmlschema", "table_to_xmlschema",
+    "schema_to_xml", "schema_to_xml_and_xmlschema", "schema_to_xmlschema",
+    "database_to_xml", "database_to_xml_and_xmlschema", "database_to_xmlschema",
+    "cursor_to_xml", "cursor_to_xmlschema",
+    # Read or change session settings (e.g. try to switch off read-only mode).
+    "set_config", "current_setting",
 })
 
 
@@ -92,8 +104,8 @@ def _table_violation(tree: exp.Expression) -> str | None:
     cte_names = {cte.alias.lower() for cte in tree.find_all(exp.CTE) if cte.alias}
     for table in tree.find_all(exp.Table):
         name, schema = table.name.lower(), table.db.lower()
-        if schema in _FORBIDDEN_SCHEMAS:
-            return f"{table.db}.{table.name} is not allowed"
+        if schema not in _ALLOWED_SCHEMAS or table.catalog:
+            return f"{table.sql(dialect=DIALECT)} is not allowed"
         if name in cte_names:
             continue
         if name not in _ALLOWED_TABLES:

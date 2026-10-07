@@ -227,7 +227,7 @@ Each component maps to one file or page (see §17).
 - **Must NOT:** Change any value. It **detects, never corrects.** It must not call the LLM or write to the DB.
 - **Depends on:** `schemas`, `config`
 
-### 3.8 Human review layer (`pages/1_Capture_and_Review.py` + `extraction.diff_fields`)
+### 3.8 Human review layer (`pages/capture_and_review/` + `extraction.diff_fields`)
 - **Responsibility:** Let the user compare the image with the draft, edit it, re-validate and confirm.
 - **Inputs:** Image, `ReceiptDraft`, flags.
 - **Outputs:** A `ConfirmedReceipt` plus the list of edited fields, or a discard.
@@ -243,7 +243,7 @@ Each component maps to one file or page (see §17).
 - **Must NOT:** Expose a general "execute any SQL" function on the writable connection. Update or delete records (no edit-after-save in the MVP).
 - **Depends on:** `sqlite3` (stdlib), `pandas` (for returning DataFrames)
 
-### 3.10 Dashboard queries (`db.py` read functions + `pages/2_Dashboard.py`)
+### 3.10 Dashboard queries (`db.py` read functions + `pages/dashboard/`)
 - **Responsibility:** Show total spend, spend by category, spend by month, and the receipts table.
 - **Inputs:** Period filter (AD month range).
 - **Outputs:** DataFrames whose money columns are in paisa, formatted to NPR by the shared formatter.
@@ -884,9 +884,18 @@ No accuracy targets are set in advance (PRD §18.4).
 bahikhata-ai/
 ├── app.py                         # Streamlit entry: home page, short instructions, DB init
 ├── pages/
-│   ├── 1_Capture_and_Review.py    # upload → extract → review → save
-│   ├── 2_Dashboard.py             # totals, by category, by month, receipts table
-│   └── 3_Ask_Your_Ledger.py       # chat-style single-turn questions
+│   ├── capture_and_review/        # upload → extract → review → save
+│   │   ├── page.py                # entry point: page flow
+│   │   ├── state.py               # session-state transitions
+│   │   └── views.py               # rendering
+│   ├── dashboard/                 # totals, by category, by month, receipts table
+│   │   ├── page.py                # entry point: page flow
+│   │   ├── data.py                # period, queries, table shaping
+│   │   └── views.py               # rendering
+│   └── ask_your_ledger/           # chat-style single-turn questions
+│       ├── page.py                # entry point: page flow
+│       ├── state.py               # answering + session transcript
+│       └── views.py               # rendering
 ├── bahikhata/                     # all logic; no Streamlit imports here
 │   ├── __init__.py
 │   ├── config.py                  # settings, paths, tolerances, model + prompt versions
@@ -1016,14 +1025,14 @@ If asked "how confident are you?", the model will happily say 0.95 for a misread
 
 | PRD req. | Architectural component | Implementation location | Test / evaluation |
 |---|---|---|---|
-| **M1** Upload JPG/PNG | Image intake + basic handling | `bahikhata/images.py`, `pages/1_Capture_and_Review.py` | `tests/test_images.py` (reject non-image, oversize, HEIC; accept JPG/PNG); demo |
+| **M1** Upload JPG/PNG | Image intake + basic handling | `bahikhata/images.py`, `pages/capture_and_review/` | `tests/test_images.py` (reject non-image, oversize, HEIC; accept JPG/PNG); demo |
 | **M2** Structured extraction | LLM client, prompts, schemas, extraction orchestrator | `llm_client.py`, `prompts/extraction_vN.txt`, `schemas.py`, `extraction.py` | extraction eval: schema-valid rate, per-field metrics, hallucination/omission |
 | **M3** Normalisation (amounts, AD+BS) | Normalizer | `normalize.py` | `tests/test_normalize.py` (amount formats, BS↔AD known pairs, ambiguous dates); eval date accuracy |
 | **M4** Validation with flags | Validation engine | `validate.py`, `config.py` (tolerances) | `tests/test_validate.py` (pass + fail per rule); eval catch rate & flag precision |
-| **M5** Human review screen | Review layer | `pages/1_Capture_and_Review.py`, `extraction.diff_fields` | demo checklist (edit → re-validate → flags update; blocking disables save); `edited_fields` stored |
+| **M5** Human review screen | Review layer | `pages/capture_and_review/`, `extraction.diff_fields` | demo checklist (edit → re-validate → flags update; blocking disables save); `edited_fields` stored |
 | **M6** Save AI + final values | Persistence + audit table | `db.py` (`save_confirmed_receipt`, DDL) | `tests/test_db.py` (round-trip, transaction rollback, FK cascade, NOT NULL / CHECK) |
-| **M7** Dashboard | Dashboard queries + page | `db.py` read functions, `pages/2_Dashboard.py` | `tests/test_db.py` (sums on known seed data = expected) |
-| **M8** NL question → SQL → result | NL→SQL module, formatter | `ask.py`, `prompts/sql_vN.txt`, `pages/3_Ask_Your_Ledger.py` | query eval: execution accuracy (x/15), out-of-scope (x/3) |
+| **M7** Dashboard | Dashboard queries + page | `db.py` read functions, `pages/dashboard/` | `tests/test_db.py` (sums on known seed data = expected) |
+| **M8** NL question → SQL → result | NL→SQL module, formatter | `ask.py`, `prompts/sql_vN.txt`, `pages/ask_your_ledger/` | query eval: execution accuracy (x/15), out-of-scope (x/3) |
 | **M9** SQL safety guard | Guard + read-only executor | `sql_guard.py`, `db.run_readonly_query` | `tests/test_sql_guard.py` (adversarial strings); `test_db.py` (write on ro connection fails); query eval 5/5 unsafe rejected + DB hash unchanged |
 | **M10** ~30 labelled receipts + extraction eval script | Evaluation harness | `data/eval/`, `schemas.GroundTruthReceipt`, `eval/run_extraction_eval.py`, `eval/metrics.py`, `eval/summarize_errors.py` | baseline + final test runs; results folders |
 | **M11** NL-query eval (~15 + 5 unsafe + 3 OOS) | Query eval harness | `eval/questions.json`, `eval/build_eval_db.py`, `eval/run_query_eval.py` | query results CSV + summary |

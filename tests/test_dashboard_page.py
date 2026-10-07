@@ -2,7 +2,7 @@
 
 A fake query layer stands in for the database: db.get_connection returns a
 dummy connection (never used for anything beyond the `with` protocol) and the
-four db.dashboard_* functions are monkeypatched to return canned rows. No
+db.dashboard_* functions are monkeypatched to return canned rows. No
 network, no real database.
 """
 
@@ -15,7 +15,7 @@ from streamlit.testing.v1 import AppTest
 
 from bahikhata import db
 
-PAGE = str(Path(__file__).resolve().parent.parent / "pages" / "2_Dashboard.py")
+PAGE = str(Path(__file__).resolve().parent.parent / "pages" / "dashboard" / "page.py")
 
 
 class DummyConnection:
@@ -26,8 +26,8 @@ class DummyConnection:
         return False
 
 
-def start(monkeypatch, *, today=date(2026, 10, 3), total_paisa=0, by_category=(), by_month=(),
-          receipts=(), connect_error: Exception | None = None) -> AppTest:
+def start(monkeypatch, *, today=date(2026, 10, 3), total_paisa=0, by_category=(),
+          receipts=(), connect_error: Exception | None = None, notice: str | None = None) -> AppTest:
     monkeypatch.setattr(db, "today", lambda: today)
     if connect_error is not None:
         def raise_error():
@@ -37,7 +37,6 @@ def start(monkeypatch, *, today=date(2026, 10, 3), total_paisa=0, by_category=()
         monkeypatch.setattr(db, "get_connection", lambda: DummyConnection())
     monkeypatch.setattr(db, "dashboard_total", lambda conn, start, end: total_paisa)
     monkeypatch.setattr(db, "dashboard_by_category", lambda conn, start, end: list(by_category))
-    monkeypatch.setattr(db, "dashboard_by_month", lambda conn, start, end: list(by_month))
     monkeypatch.setattr(
         db, "dashboard_receipts",
         lambda conn, start, end, status=None, limit=500: [
@@ -45,6 +44,8 @@ def start(monkeypatch, *, today=date(2026, 10, 3), total_paisa=0, by_category=()
         ],
     )
     at = AppTest.from_file(PAGE, default_timeout=30)
+    if notice is not None:
+        at.session_state["ledger_notice"] = notice
     at.run()
     return at
 
@@ -52,10 +53,6 @@ def start(monkeypatch, *, today=date(2026, 10, 3), total_paisa=0, by_category=()
 CATEGORY_ROWS = [
     {"category": "Food", "total_paisa": 150000, "receipt_count": 2},
     {"category": "Inventory", "total_paisa": 200000, "receipt_count": 1},
-]
-MONTH_ROWS = [
-    {"month": date(2026, 9, 1), "total_paisa": 100000},
-    {"month": date(2026, 10, 1), "total_paisa": 200000},
 ]
 RECEIPT_ROWS = [
     {"id": 2, "date_ad": date(2026, 9, 20), "merchant_name": "Shree Traders", "total_paisa": 200000,
@@ -78,31 +75,30 @@ def test_total_metric_shows_formatted_npr(monkeypatch):
 
 
 def test_empty_database_shows_friendly_message_no_crash(monkeypatch):
-    at = start(monkeypatch, total_paisa=0, by_category=[], by_month=[], receipts=[])
+    at = start(monkeypatch, total_paisa=0, by_category=[], receipts=[])
     assert not at.exception
     assert at.metric[0].value == "Rs 0.00"
-    infos = [i.value for i in at.info]
-    assert infos.count("No receipts in this period.") == 3  # category, month and receipts sections
-    assert len(at.dataframe) == 0  # no category table, no receipts table rendered
+    assert [i.value for i in at.info] == ["No receipts in this period."]
+    assert len(at.dataframe) == 0
 
 
-def test_by_category_table_and_chart(monkeypatch):
-    at = start(monkeypatch, by_category=CATEGORY_ROWS)
-    assert not at.exception  # includes the st.bar_chart call, which AppTest can't inspect directly
-    assert len(at.dataframe) == 1
-    table = at.dataframe[0].value
-    assert list(table["Category"]) == ["Food", "Inventory"]
-    assert list(table["Total"]) == ["Rs 1,500.00", "Rs 2,000.00"]
+def test_banner_kpis_filters_table_in_order(monkeypatch):
+    at = start(monkeypatch, by_category=CATEGORY_ROWS, receipts=RECEIPT_ROWS)
+    keys = [getattr(e, "key", None) or getattr(e, "type", None) for e in elements_in_order(at)]
+    order = [keys.index(k) for k in ("html", "metric", "period", "receipts_table")]
+    assert order == sorted(order)
+    assert len(at.dataframe) == 1  # no category table any more, only the receipts
 
 
-def test_by_month_separates_boundary_receipts(monkeypatch):
-    at = start(monkeypatch, by_month=MONTH_ROWS)
-    assert not at.exception  # a receipt on 2026-09-30 and one on 2026-10-01 render as two distinct bars
+def test_kpis_from_categories(monkeypatch):
+    at = start(monkeypatch, total_paisa=350000, by_category=CATEGORY_ROWS)
+    assert [m.value for m in at.metric] == ["Rs 3,500.00", "3", "Food", "Rs 1,166.67"]
 
 
 def test_receipts_table_newest_first_with_formatted_total(monkeypatch):
     at = start(monkeypatch, receipts=RECEIPT_ROWS)
     table = at.dataframe[-1].value
+    assert list(table["#"]) == [2, 1]
     assert list(table["Date"]) == [date(2026, 9, 20), date(2026, 9, 1)]
     assert list(table["Total"]) == ["Rs 2,000.00", "Rs 500.00"]
     assert list(table["Status"]) == ["clean", "needs_review"]
@@ -143,3 +139,23 @@ def test_connection_failure_shows_one_message_no_traceback(monkeypatch):
     assert not at.exception
     assert len(at.error) == 1
     assert "Couldn't reach the database" in at.error[0].value
+
+
+def test_edit_is_disabled_until_a_row_is_selected(monkeypatch):
+    at = start(monkeypatch, receipts=RECEIPT_ROWS)
+    assert at.button(key="edit_receipt").disabled
+
+
+def test_notice_from_a_save_is_shown_once(monkeypatch):
+    at = start(monkeypatch, notice="Updated receipt #2.")
+    assert at.success[0].value == "Updated receipt #2."
+    at.run()
+    assert len(at.success) == 0
+
+
+def elements_in_order(at: AppTest) -> list:
+    def walk(node):
+        yield node
+        for child in getattr(node, "children", {}).values():
+            yield from walk(child)
+    return list(walk(at.main))

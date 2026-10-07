@@ -1,20 +1,3 @@
-# BahiKhata AI -- database migrations (Alembic, Amendment A2).
-#
-# Targets a Neon Postgres database. Which one is picked by TARGET:
-#   TARGET=main (default) -> DATABASE_URL       (the real Neon "neondb")
-#   TARGET=eval            -> EVAL_DATABASE_URL  (Neon "ledger_eval")
-#   TARGET=test             -> TEST_DATABASE_URL (Neon "ledger_test")
-# All three env vars are read from .env (see .env.example); migrations/env.py
-# does the lookup and refuses eval/test targets that don't point at a
-# database whose name ends in _eval / _test, so main (your real ledger data)
-# can't be hit by mistake.
-#
-# Examples:
-#   make migrate                 # apply pending migrations to Neon (DATABASE_URL)
-#   make migrate TARGET=test     # apply pending migrations to ledger_test
-#   make migrate-reset           # DROP everything and re-apply from scratch (destructive)
-#   make migrate-new name="add foo column"
-
 TARGET ?= main
 ALEMBIC := ALEMBIC_TARGET=$(TARGET) uv run alembic
 
