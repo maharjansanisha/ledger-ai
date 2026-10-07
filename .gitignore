@@ -12,6 +12,7 @@ data/images/*
 !data/images/.gitkeep
 data/cache/*
 !data/cache/.gitkeep
+data/rag/
 # Eval receipt images stay local until masked (r001 is a medical receipt).
 data/eval/**/*.png
 data/eval/**/*.jpg

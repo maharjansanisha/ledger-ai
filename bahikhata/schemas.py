@@ -204,6 +204,15 @@ class QueryPlan(BaseModel):
     clarification: str | None = None
 
 
+class Source(BaseModel):
+    """A document chunk an answer cited (hybrid Ask Your Ledger)."""
+
+    doc_name: str
+    chunk_id: str
+    score: float
+    snippet: str
+
+
 class QueryResult(BaseModel):
     """To the UI and eval. Money in formatted_rows is formatted by code, never the LLM."""
 
@@ -215,5 +224,8 @@ class QueryResult(BaseModel):
     formatted_rows: list[tuple[Any, ...]] = Field(default_factory=list)
     message: str | None = None               # refusal / error / "No matching records."
     explanation: str | None = None           # S2, only if it passed the number check
+    route: Literal["sql", "docs", "both"] | None = None  # hybrid strategy only
+    answer: str | None = None                # from documents (and rows); only if it passed the number check
+    sources: list[Source] = Field(default_factory=list)
     prompt_version: str
     model_name: str
