@@ -43,6 +43,7 @@ _OUT_OF_SCOPE = "I can only answer questions about your saved receipts."
 _NO_MATCH = "No matching records."
 _COULD_NOT_BUILD = "I couldn't build a valid query — try rephrasing."
 _GENERIC_CLARIFICATION = "Could you rephrase that? I wasn't sure what you meant."
+_DB_UNREACHABLE = "I couldn't reach your ledger database right now — please try again shortly."
 
 
 def today() -> date:
@@ -254,6 +255,11 @@ def answer_question(question: str, today: date, *, strategy: str = "text_to_sql"
         message = _REFUSED_UNSAFE if not guard_result.retryable else _COULD_NOT_BUILD
         return QueryResult(**base, plan=plan, message=message)
 
+    if exec_result is not None and exec_result.connection_failed:
+        # The SQL never reached the database: retrying the LLM can't fix this, and
+        # "try rephrasing" would send the user chasing the wrong problem.
+        return QueryResult(**base, plan=plan, message=_DB_UNREACHABLE)
+
     if not retried and exec_result is not None and not exec_result.ok:
         retry_plan, _ = _get_plan(
             stripped, today,
@@ -265,9 +271,11 @@ def answer_question(question: str, today: date, *, strategy: str = "text_to_sql"
             if not guard_result.ok:
                 message = _REFUSED_UNSAFE if not guard_result.retryable else _COULD_NOT_BUILD
                 return QueryResult(**base, plan=plan, message=message)
+            if exec_result is not None and exec_result.connection_failed:
+                return QueryResult(**base, plan=plan, message=_DB_UNREACHABLE)
 
     if exec_result is None or not exec_result.ok:
-        return QueryResult(**base, plan=plan, sql_executed=guard_result.sql_to_run, message=_COULD_NOT_BUILD)
+        return QueryResult(**base, plan=plan, message=_COULD_NOT_BUILD)
 
     if _is_empty_result(exec_result.rows):
         return QueryResult(

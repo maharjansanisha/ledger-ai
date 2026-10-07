@@ -3,8 +3,8 @@
 Raw psycopg v3 and hand-written, parameterised SQL; no ORM. The tables are
 created by the Alembic migrations in migrations/versions/, not here.
 
-save_confirmed_receipt() is the only write path: receipts + line_items +
-receipt_audit in one transaction. There is deliberately no general "execute any
+save_confirmed_receipt() and update_confirmed_receipt() are the only write
+paths: receipts + line_items + receipt_audit in one transaction. There is deliberately no general "execute any
 SQL" function on the writable connection.
 
 Connections are opened per operation (Neon is serverless; no global connection):
@@ -15,7 +15,7 @@ Connections are opened per operation (Neon is serverless; no global connection):
 
 import calendar
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import psycopg
@@ -124,6 +124,59 @@ def save_confirmed_receipt(
             ])
         cur.execute(_INSERT_AUDIT, _audit_params(receipt_id, audit))
     return receipt_id
+
+
+_UPDATE_RECEIPT = """
+    UPDATE receipts SET
+        merchant_name = %(merchant_name)s, merchant_pan = %(merchant_pan)s,
+        invoice_number = %(invoice_number)s, date_ad = %(date_ad)s, date_bs = %(date_bs)s,
+        bs_year = %(bs_year)s, bs_month = %(bs_month)s, subtotal_paisa = %(subtotal_paisa)s,
+        discount_paisa = %(discount_paisa)s, service_charge_paisa = %(service_charge_paisa)s,
+        vat_paisa = %(vat_paisa)s, total_paisa = %(total_paisa)s, category = %(category)s,
+        status = %(status)s, user_override = %(user_override)s
+    WHERE id = %(id)s
+"""
+
+_UPDATE_AUDIT = """
+    UPDATE receipt_audit SET
+        flags_at_save_json = %(flags_at_save_json)s, edited_fields_json = %(edited_fields_json)s,
+        confirmed_at = %(confirmed_at)s
+    WHERE receipt_id = %(receipt_id)s
+"""
+
+
+def update_confirmed_receipt(
+    conn: psycopg.Connection, receipt_id: int, receipt: ConfirmedReceipt, *,
+    flags_at_save: list[dict[str, Any]], edited_fields: list[str], confirmed_at: datetime,
+) -> None:
+    """Overwrite a saved receipt with re-reviewed values, atomically.
+
+    The image and the AI's side of the audit row (raw response, AI draft) are kept;
+    the line items are replaced, and the audit row's save-time fields are refreshed.
+    Raises LookupError if the receipt does not exist (nothing is changed).
+    """
+    with conn.transaction(), conn.cursor() as cur:
+        cur.execute(_UPDATE_RECEIPT, {**_receipt_params(receipt), "id": receipt_id})
+        if cur.rowcount == 0:
+            raise LookupError(f"receipt {receipt_id} not found")
+        cur.execute("DELETE FROM line_items WHERE receipt_id = %s", (receipt_id,))
+        if receipt.line_items:
+            cur.executemany(_INSERT_LINE_ITEM, [
+                _line_item_params(receipt_id, line_no, item)
+                for line_no, item in enumerate(receipt.line_items, start=1)
+            ])
+        cur.execute(_UPDATE_AUDIT, {
+            "receipt_id": receipt_id, "flags_at_save_json": Jsonb(flags_at_save),
+            "edited_fields_json": Jsonb(edited_fields), "confirmed_at": confirmed_at,
+        })
+
+
+def get_ai_draft_json(conn: psycopg.Connection, receipt_id: int) -> dict[str, Any] | None:
+    """The AI's normalized draft saved with the receipt (receipt_audit.ai_draft_json), or None."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT ai_draft_json FROM receipt_audit WHERE receipt_id = %s", (receipt_id,))
+        row = cur.fetchone()
+    return None if row is None else row[0]
 
 
 def get_receipt(conn: psycopg.Connection, receipt_id: int) -> dict[str, Any] | None:
@@ -262,9 +315,9 @@ def dashboard_receipts(
 # --- Read-only executor (ARCHITECTURE.md §3.13, §6; Amendment A1; TASK-022) --
 #
 # Runs one already-guarded SELECT. Defence in depth even if sql_guard.check_sql
-# is bypassed: the session is forced read-only and time-capped by GUC settings
-# (so a write fails even under the owner role, as plain SQL cannot re-enable
-# writes mid-session), and the default target (DATABASE_URL_READONLY) connects
+# is bypassed: the transaction is forced read-only and time-capped before the
+# query runs (so a write fails even under the owner role, as Postgres refuses to
+# switch a transaction to read-write once it has run a query), and the default target (DATABASE_URL_READONLY) connects
 # as `ledger_reader`, which has no grant on receipt_audit or any write grant at
 # all -- two independent locks. Never raises a raw psycopg error to the caller.
 
@@ -274,6 +327,9 @@ class QueryExecutionResult:
     columns: list[str] = field(default_factory=list)
     rows: list[tuple[Any, ...]] = field(default_factory=list)
     error: str | None = None
+    # True when the connection itself failed (bad host/credentials, network) -- the
+    # SQL never reached the database, so rewriting it can't help.
+    connection_failed: bool = False
 
 
 def _safe_execution_error(exc: psycopg.Error) -> str:
@@ -295,12 +351,20 @@ def run_readonly_query(sql: str, url: str | None = None) -> QueryExecutionResult
     without needing a reader role on the test database.
     """
     target = url if url is not None else config.get_database_url_readonly()
-    options = (
-        f"-c default_transaction_read_only=on "
-        f"-c statement_timeout={config.READONLY_STATEMENT_TIMEOUT_MS}"
-    )
     try:
-        with psycopg.connect(target, options=options) as conn, conn.cursor() as cur:
+        conn = psycopg.connect(target)
+    except psycopg.Error:
+        return QueryExecutionResult(
+            ok=False, error="Couldn't connect to the database.", connection_failed=True,
+        )
+    try:
+        with conn, conn.cursor() as cur:
+            # Set per transaction (SET LOCAL / SET TRANSACTION), not as connection startup
+            # options: Neon's pooler rejects startup options, and a session-level SET
+            # could leak to other clients sharing a pooled server connection. Both run
+            # before the query, inside the same transaction, which then commits/rolls back.
+            cur.execute("SET TRANSACTION READ ONLY")
+            cur.execute(f"SET LOCAL statement_timeout = {int(config.READONLY_STATEMENT_TIMEOUT_MS)}")
             cur.execute(sql)
             if cur.description is None:
                 return QueryExecutionResult(ok=True)

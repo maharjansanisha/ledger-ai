@@ -64,6 +64,7 @@ QUERY_ALLOWED_TABLES = ("receipts", "line_items")
 SQL_ROW_LIMIT = 200
 MAX_QUESTION_CHARS = 500
 READONLY_STATEMENT_TIMEOUT_MS = 5000  # Amendment A1: statement_timeout=5s
+READONLY_ROLE = "ledger_reader"  # the only role Ask Your Ledger may connect as
 
 
 def get_gemini_api_key() -> str:
@@ -104,6 +105,18 @@ def get_database_url_readonly() -> str:
             "DATABASE_URL_READONLY is not set. See .env.example and ARCHITECTURE.md "
             "Amendment A1 / TASK-005: create the ledger_reader role in the Neon SQL editor, "
             "grant it SELECT on receipts and line_items, then add its connection string here."
+        )
+    from psycopg.conninfo import conninfo_to_dict  # local: keep config importable without psycopg
+
+    try:
+        user = conninfo_to_dict(url).get("user") or ""
+    except Exception:  # malformed URL; never echo it (it holds the password)
+        user = ""
+    if user != READONLY_ROLE:
+        raise RuntimeError(
+            f"DATABASE_URL_READONLY must connect as {READONLY_ROLE!r}, not the owner or any other "
+            "role: that role's SELECT-only grant on receipts and line_items is one of Ask Your "
+            "Ledger's two independent locks (Amendment A1)."
         )
     return url
 

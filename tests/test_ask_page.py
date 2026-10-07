@@ -14,7 +14,7 @@ from streamlit.testing.v1 import AppTest
 from bahikhata import ask, config, llm_client
 from bahikhata.schemas import QueryPlan, QueryResult
 
-PAGE = str(Path(__file__).resolve().parent.parent / "pages" / "3_Ask_Your_Ledger.py")
+PAGE = str(Path(__file__).resolve().parent.parent / "pages" / "ask_your_ledger" / "page.py")
 
 BASE = {"prompt_version": config.SQL_PROMPT, "model_name": config.MODEL_NAME}
 

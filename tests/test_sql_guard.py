@@ -78,12 +78,20 @@ UNSAFE_NON_RETRYABLE = [
     "SELECT * FROM pg_catalog.pg_tables",
     "SELECT * FROM information_schema.tables",
     "SELECT * FROM information_schema.columns WHERE table_name = 'receipts'",
+    "SELECT * FROM other_schema.receipts",                  # allowed name, wrong schema
+    "SELECT * FROM otherdb.public.receipts",                # catalog-qualified
     # Functions that read files, sleep, or reach other databases/processes
     "SELECT pg_sleep(10)",
     "SELECT PG_SLEEP(10)",                                   # case trick
     "SELECT pg_read_file('/etc/passwd')",
     "SELECT dblink('x', 'y')",
     "SELECT lo_import('/etc/passwd')",
+    # Functions that run their own SQL string (invisible to the table check) or touch settings
+    "SELECT query_to_xml('SELECT * FROM receipt_audit', true, true, '')",
+    "SELECT table_to_xml('receipt_audit', true, true, '')",
+    "SELECT * FROM receipts WHERE merchant_name = CAST(query_to_xml('SELECT 1', true, true, '') AS TEXT)",
+    "SELECT set_config('default_transaction_read_only', 'off', false)",
+    "SELECT current_setting('server_version')",
     # Query shape not supported (narrow, safe default-deny)
     "SELECT * FROM receipts UNION SELECT * FROM line_items",
 ]

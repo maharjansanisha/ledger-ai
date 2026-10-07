@@ -12,13 +12,14 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+import streamlit as st
 from PIL import Image
 from streamlit.testing.v1 import AppTest
 
-from bahikhata import config, llm_client, review
+from bahikhata import config, db, llm_client, review
 from tests.fakes import FakeClient, client_error
 
-PAGE = str(Path(__file__).resolve().parent.parent / "pages" / "1_Capture_and_Review.py")
+PAGE = str(Path(__file__).resolve().parent.parent / "pages" / "capture_and_review" / "page.py")
 GOOD = {
     "merchant_name": "Shree Traders", "merchant_pan": "123456789", "date_raw": "2083/06/14",
     "date_calendar_hint": "BS", "subtotal_raw": "Rs. 1,000.00", "vat_amount_raw": "130.00",
@@ -51,8 +52,18 @@ def env(tmp_path, monkeypatch):
     return respond
 
 
-def start(upload=None) -> AppTest:
+@pytest.fixture
+def switched(monkeypatch):
+    """Records st.switch_page calls (the page files aren't registered when AppTest runs one page)."""
+    calls = []
+    monkeypatch.setattr(st, "switch_page", lambda page, query_params=None: calls.append(page))
+    return calls
+
+
+def start(upload=None, query_params=None) -> AppTest:
     at = AppTest.from_file(PAGE, default_timeout=30)
+    for name, value in (query_params or {}).items():
+        at.query_params[name] = value
     at.run()
     if upload is not None:
         at.file_uploader[0].set_value(("receipt.png", upload, "image/png"))
@@ -137,7 +148,7 @@ def test_unparseable_amount_shows_inline_error(env):
     assert any("N1" in c.value and "1.30.00" in c.value for c in at.caption)
 
 
-def test_v5_needs_save_anyway_checkbox(env, monkeypatch):
+def test_v5_needs_save_anyway_checkbox(env, monkeypatch, switched):
     env(json.dumps({**GOOD, "total_raw": "1,220"}))
     saved = {}
     monkeypatch.setattr("bahikhata.db.get_connection", lambda: _FakeConn())
@@ -148,7 +159,8 @@ def test_v5_needs_save_anyway_checkbox(env, monkeypatch):
     assert "save anyway" in at.error[0].value and "r" not in saved
     at.checkbox(key="override_1").check()
     submit(at, "Confirm & Save")
-    assert "Saved receipt #9" in at.success[0].value
+    assert switched == ["pages/dashboard/page.py"]
+    assert at.session_state["ledger_notice"] == "Saved receipt #9."
     assert saved["r"].user_override is True and saved["r"].status == "invalid"
 
 
@@ -160,15 +172,76 @@ class _FakeConn:
         return False
 
 
-def test_save_success_shows_id(env, monkeypatch):
+def test_save_success_redirects_to_dashboard(env, monkeypatch, switched):
     env(json.dumps(GOOD))
     monkeypatch.setattr("bahikhata.db.get_connection", lambda: _FakeConn())
     monkeypatch.setattr("bahikhata.db.save_confirmed_receipt", lambda c, r, p, a: 42)
     at = extract(start(png()))
     submit(at, "Confirm & Save")
     assert not at.exception
-    assert "Saved receipt #42" in at.success[0].value
+    assert switched == ["pages/dashboard/page.py"]
+    assert at.session_state["ledger_notice"] == "Saved receipt #42."
+    assert "phase" not in at.session_state  # the page is cleared for the next receipt
     assert list(config.IMAGES_DIR.glob("*.jpg"))
+
+
+# --- Edit a saved receipt (?edit=<id>) -----------------------------------------
+
+SAVED_ROW = {
+    "id": 7, "merchant_name": "Shree Traders", "merchant_pan": "123456789", "invoice_number": "INV-1",
+    "date_ad": date(2026, 9, 30), "date_bs": "2083-06-14", "bs_year": 2083, "bs_month": 6,
+    "subtotal_paisa": 100000, "discount_paisa": None, "service_charge_paisa": None, "vat_paisa": 13000,
+    "total_paisa": 113000, "category": "Inventory", "status": "clean", "user_override": False,
+    "image_path": "missing/receipt.jpg",
+    "line_items": [{"line_no": 1, "description": "Rice", "quantity": 2.0,
+                    "unit_price_paisa": 50000, "amount_paisa": 100000}],
+}
+
+
+@pytest.fixture
+def saved_db(monkeypatch):
+    """A fake ledger holding SAVED_ROW; returns the dict update calls are recorded in."""
+    updates = {}
+    monkeypatch.setattr(db, "get_connection", lambda: _FakeConn())
+    monkeypatch.setattr(db, "get_receipt", lambda conn, rid: SAVED_ROW if rid == 7 else None)
+    monkeypatch.setattr(db, "get_ai_draft_json", lambda conn, rid: None)
+
+    def update(conn, rid, receipt, **audit):
+        updates.update(id=rid, receipt=receipt, **audit)
+    monkeypatch.setattr(db, "update_confirmed_receipt", update)
+    return updates
+
+
+def test_edit_loads_saved_values_without_calling_the_api(env, saved_db):
+    client = env(json.dumps(GOOD))
+    at = start(query_params={"edit": "7"})
+    assert not at.exception
+    assert client.calls == []
+    assert at.title[0].value == "Edit receipt #7"
+    assert len(at.file_uploader) == 0
+    assert at.text_input(key="merchant_name_1").value == "Shree Traders"
+    assert at.text_input(key="date_raw_1").value == "2083/06/14"
+    assert at.text_input(key="total_1").value == "1130.00"
+    assert "2026-09-30" in text(at) and "clean" in text(at)
+    assert "could not be found" in at.info[0].value  # image file missing: message, not a crash
+    assert not save_button(at).disabled
+
+
+def test_edit_save_updates_and_redirects(env, saved_db, switched):
+    env()
+    at = start(query_params={"edit": "7"})
+    at.text_input(key="merchant_name_1").set_value("Shree Traders Pvt")
+    submit(at, "Confirm & Save")
+    assert not at.exception
+    assert saved_db["id"] == 7 and saved_db["receipt"].merchant_name == "Shree Traders Pvt"
+    assert switched == ["pages/dashboard/page.py"]
+    assert at.session_state["ledger_notice"] == "Updated receipt #7."
+
+
+def test_edit_unknown_receipt_shows_message(env, saved_db):
+    at = start(query_params={"edit": "99"})
+    assert not at.exception
+    assert "#99 was not found" in at.error[0].value
 
 
 def test_missing_database_url_keeps_edits(env, monkeypatch):

@@ -14,6 +14,8 @@ import math
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
+from decimal import Decimal
+from pathlib import Path
 from typing import Any, Callable
 
 import psycopg
@@ -25,6 +27,7 @@ from bahikhata.images import ProcessedImage
 from bahikhata.normalize import normalize_extraction
 from bahikhata.schemas import (
     ConfirmedReceipt,
+    DraftLineItem,
     ExtractedLineItem,
     ReceiptDraft,
     ReceiptExtraction,
@@ -221,6 +224,20 @@ def write_image(image: ProcessedImage) -> str:
         return str(path)
 
 
+def _confirm(current: Review, user_override: bool) -> ConfirmedReceipt:
+    """Apply the save rules to `current` and build the strict record; raises SaveError."""
+    if not current.can_save:
+        raise SaveError("Fix the ⛔ problems above before saving.")
+    override = user_override and current.needs_override  # only meaningful for an ERROR (V5)
+    if not may_save(current.flags, override):
+        raise SaveError("The amounts don't add up (V5). Check them, then tick “I checked this, save anyway”.")
+    try:
+        return build_confirmed(current.draft, current.status, override)
+    except ValidationError as exc:
+        fields = ", ".join(str(e["loc"][0]) for e in exc.errors())
+        raise SaveError(f"Some values are missing or invalid: {fields}.") from exc
+
+
 def save_receipt(
     *,
     current: Review,
@@ -236,17 +253,7 @@ def save_receipt(
     Raises SaveError (user-safe message) if the save rules refuse it or anything fails;
     nothing is half-saved (one DB transaction).
     """
-    if not current.can_save:
-        raise SaveError("Fix the ⛔ problems above before saving.")
-    override = user_override and current.needs_override  # only meaningful for an ERROR (V5)
-    if not may_save(current.flags, override):
-        raise SaveError("The amounts don't add up (V5). Check them, then tick “I checked this, save anyway”.")
-    try:
-        confirmed = build_confirmed(current.draft, current.status, override)
-    except ValidationError as exc:
-        fields = ", ".join(str(e["loc"][0]) for e in exc.errors())
-        raise SaveError(f"Some values are missing or invalid: {fields}.") from exc
-
+    confirmed = _confirm(current, user_override)
     audit = db.AuditRecord(
         **audit_payload,
         flags_at_save_json=[f.model_dump() for f in current.flags],
@@ -265,3 +272,102 @@ def save_receipt(
                         "Your edits are kept.") from exc
     except psycopg.Error as exc:  # connection or constraint failure; message may name the host, so not shown
         raise SaveError(f"Couldn't save ({type(exc).__name__}) — your edits are kept, try again.") from exc
+
+
+# --- Edit a saved receipt ------------------------------------------------------
+
+class LoadError(Exception):
+    """A saved receipt could not be opened for editing. str(error) is safe to show."""
+
+
+@dataclass
+class SavedReceipt:
+    """A saved receipt, ready to show in the review form (no LLM call involved)."""
+
+    receipt_id: int
+    draft: ReceiptDraft      # what is saved now, as form input
+    ai_draft: ReceiptDraft   # what the AI read originally (for edited_fields_json)
+    image_bytes: bytes | None
+
+
+def receipt_to_draft(row: dict[str, Any]) -> ReceiptDraft:
+    """A db.get_receipt() row -> ReceiptDraft. The date goes back in as the saved BS date,
+    which the normalizer reads unambiguously (4-digit BS year)."""
+    return ReceiptDraft(
+        merchant_name=row["merchant_name"], merchant_pan=row["merchant_pan"],
+        invoice_number=row["invoice_number"], date_raw=row["date_bs"].replace("-", "/"),
+        date_calendar_hint="BS", date_ad=row["date_ad"], date_bs=row["date_bs"],
+        bs_year=row["bs_year"], bs_month=row["bs_month"],
+        **{paisa_field: row[paisa_field] for _, paisa_field in AMOUNT_FIELDS.values()},
+        category=row["category"],
+        line_items=[
+            DraftLineItem(
+                description=item["description"],
+                # REAL column: go through str() so 1.5 stays Decimal("1.5"), not a binary float.
+                quantity=None if item["quantity"] is None else Decimal(str(item["quantity"])),
+                unit_price_paisa=item["unit_price_paisa"], amount_paisa=item["amount_paisa"],
+            )
+            for item in row["line_items"]
+        ],
+    )
+
+
+def _read_image(image_path: str) -> bytes | None:
+    path = Path(image_path)
+    if not path.is_absolute():
+        path = config.PROJECT_ROOT / path
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def load_saved_receipt(receipt_id: int, connect: Callable[[], psycopg.Connection] | None = None) -> SavedReceipt:
+    """Read a saved receipt (and the AI draft from its audit row) for editing; raises LoadError."""
+    try:
+        with (connect or db.get_connection)() as conn:
+            row = db.get_receipt(conn, receipt_id)
+            ai_draft_json = db.get_ai_draft_json(conn, receipt_id) if row is not None else None
+    except RuntimeError as exc:
+        raise LoadError("The database is not configured: set DATABASE_URL in .env, then try again.") from exc
+    except psycopg.Error as exc:
+        raise LoadError("Couldn't reach the database right now. Check your connection and try again.") from exc
+    if row is None:
+        raise LoadError(f"Receipt #{receipt_id} was not found. It may have been deleted.")
+    return SavedReceipt(
+        receipt_id=receipt_id,
+        draft=receipt_to_draft(row),
+        ai_draft=ReceiptDraft.model_validate(ai_draft_json) if ai_draft_json else ReceiptDraft(),
+        image_bytes=_read_image(row["image_path"]),
+    )
+
+
+def update_receipt(
+    *,
+    receipt_id: int,
+    current: Review,
+    ai_draft: ReceiptDraft,
+    user_override: bool,
+    connect: Callable[[], psycopg.Connection] | None = None,
+) -> int:
+    """Save edits to an existing receipt (same rules as save_receipt); return its id.
+
+    Raises SaveError (user-safe message); nothing is half-saved (one DB transaction).
+    """
+    confirmed = _confirm(current, user_override)
+    try:
+        with (connect or db.get_connection)() as conn:
+            db.update_confirmed_receipt(
+                conn, receipt_id, confirmed,
+                flags_at_save=[f.model_dump() for f in current.flags],
+                edited_fields=diff_fields(ai_draft, confirmed),
+                confirmed_at=datetime.now(timezone.utc),
+            )
+    except LookupError as exc:
+        raise SaveError(f"Receipt #{receipt_id} no longer exists, so it can't be updated.") from exc
+    except RuntimeError as exc:
+        raise SaveError("The database is not configured: set DATABASE_URL in .env, then try again. "
+                        "Your edits are kept.") from exc
+    except psycopg.Error as exc:
+        raise SaveError(f"Couldn't save ({type(exc).__name__}) — your edits are kept, try again.") from exc
+    return receipt_id
