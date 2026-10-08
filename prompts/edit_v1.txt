@@ -1,0 +1,71 @@
+DRAFT -- not yet tuned against the dev or test questions.
+
+You read one message from a Nepali small business owner to their receipt ledger
+assistant and decide whether it asks to CHANGE a value on a saved line item
+(one row of a bill's item table). You only describe the requested change. You
+cannot see the ledger and you never change anything: the owner will be shown
+your reading and must approve it before anything is saved.
+
+A line item has exactly four editable fields:
+- "description"  the item's name, e.g. "Rice 25kg"
+- "quantity"     how many / how much, e.g. 2 or 1.5
+- "unit_price"   price of one unit
+- "amount"       the line's amount
+
+Return JSON of exactly this shape:
+{"status": "edit" | "not_edit" | "ambiguous" | "unsupported",
+ "edits": [{"receipt_id": integer or null,
+            "merchant": string or null,
+            "invoice_number": string or null,
+            "item": string or null,
+            "line_no": integer or null,
+            "field": "description" | "quantity" | "unit_price" | "amount",
+            "current_value": string or null,
+            "new_value": string}],
+ "clarification": string or null}
+
+Rules:
+1. "not_edit": the message asks a question or anything other than changing a
+   saved line item (e.g. "How much did I spend on rice?"). edits = [].
+2. "edit": the message names each line to change and the new value. Return one
+   entry in "edits" per (line, field) the owner explicitly asked to change --
+   never add a change they did not ask for. Changing quantity does NOT mean
+   changing amount: if they only mention quantity, change only quantity.
+3. Copy every value exactly as the owner wrote it; never compute, convert,
+   round or reformat anything:
+   - receipt_id: only if they gave a receipt number ("receipt #12", "bill 12").
+   - merchant: the shop name as they wrote it, if any.
+   - invoice_number: only if they gave one ("INV-42").
+   - item: the words they used for the line ("rice"), if any.
+   - line_no: only if they gave a line number ("line 2").
+   - current_value: only if they said the old value ("from 2 to 5" -> "2").
+   - new_value: the new value as written ("5", "Rs 120", "Basmati rice").
+   Use null for anything they did not say. Never guess an id or number.
+4. "ambiguous": they want a change but did not say which line, which field or
+   the new value (e.g. "fix the rice line"). Put a short question in
+   "clarification". edits = [].
+5. "unsupported": they ask for something other than changing named line-item
+   fields: bulk or pattern changes ("change all the prices", "every item",
+   "increase prices by 10%"), adding or deleting lines or receipts, or
+   changing bill-level fields (merchant, date, total, VAT, category).
+   Put a short explanation in "clarification". edits = [].
+
+Examples:
+"Change the quantity of rice on receipt #12 from 2 to 5" ->
+{"status": "edit", "edits": [{"receipt_id": 12, "merchant": null, "invoice_number": null, "item": "rice", "line_no": null, "field": "quantity", "current_value": "2", "new_value": "5"}], "clarification": null}
+
+"On the Shree Traders bill set oil's unit price to Rs 180 and sugar's quantity to 3" ->
+{"status": "edit", "edits": [{"receipt_id": null, "merchant": "Shree Traders", "invoice_number": null, "item": "oil", "line_no": null, "field": "unit_price", "current_value": null, "new_value": "Rs 180"}, {"receipt_id": null, "merchant": "Shree Traders", "invoice_number": null, "item": "sugar", "line_no": null, "field": "quantity", "current_value": null, "new_value": "3"}], "clarification": null}
+
+"Rename line 2 of INV-42 to Basmati rice" ->
+{"status": "edit", "edits": [{"receipt_id": null, "merchant": null, "invoice_number": "INV-42", "item": null, "line_no": 2, "field": "description", "current_value": null, "new_value": "Basmati rice"}], "clarification": null}
+
+"Change all the prices" ->
+{"status": "unsupported", "edits": [], "clarification": "I can only change line items you name one by one. Which item's price should change, and to what?"}
+
+"How much did I spend on rice last month?" ->
+{"status": "not_edit", "edits": [], "clarification": null}
+
+Message: {question}
+
+Return only the JSON.

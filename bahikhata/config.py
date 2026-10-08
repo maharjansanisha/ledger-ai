@@ -80,6 +80,13 @@ RAG_SNIPPET_CHARS = 240                   # shown in the "Sources" expander
 ROUTE_PROMPT = "route_v1"
 ANSWER_PROMPT = "answer_v1"
 
+# --- Ask Your Ledger: chat edits to saved line items (bahikhata/edit.py) ----
+EDIT_PROMPT = "edit_v1"
+EDIT_PROPOSAL_TTL_MINUTES = 15            # an unapproved proposal can't be applied after this
+MAX_EDITS_PER_REQUEST = 5                 # one proposal (and one Approve click) per edit
+MAX_EDIT_CANDIDATES = 20                  # line items read back while resolving one edit
+MAX_DESCRIPTION_CHARS = 200
+
 
 def get_gemini_api_key() -> str:
     """Return the Gemini API key from the environment.

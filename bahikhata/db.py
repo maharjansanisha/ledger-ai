@@ -4,7 +4,9 @@ Raw psycopg v3 and hand-written, parameterised SQL; no ORM. The tables are
 created by the Alembic migrations in migrations/versions/, not here.
 
 save_confirmed_receipt() and update_confirmed_receipt() are the only write
-paths: receipts + line_items + receipt_audit in one transaction. There is deliberately no general "execute any
+paths for a whole receipt: receipts + line_items + receipt_audit in one transaction.
+The chat edit primitives further down change one line-item cell, and only as part of
+bahikhata/edit.py's approve step. There is deliberately no general "execute any
 SQL" function on the writable connection.
 
 Connections are opened per operation (Neon is serverless; no global connection):
@@ -17,6 +19,7 @@ import calendar
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
+from uuid import UUID
 
 import psycopg
 from psycopg.rows import dict_row
@@ -204,6 +207,169 @@ def list_receipts(conn: psycopg.Connection, limit: int = 50) -> list[dict[str, A
             (limit,),
         )
         return cur.fetchall()
+
+
+# --- Chat edits to one line-item cell (migration 0003; bahikhata/edit.py) ----
+#
+# Narrow primitives that edit.py composes inside ONE transaction; none of them
+# commits on its own. The chat's proposal step only reads (find_line_items) and
+# records a 'pending' row (insert_edit_proposals). The bill changes only through
+# update_line_item_field(), whose UPDATE names the exact receipt, line item and
+# column, and also requires the whole line to still equal the snapshot taken when
+# the change was proposed -- compare-and-swap, so a stale proposal changes nothing.
+
+# EditField -> line_items column. A column name in edit SQL only ever comes from here.
+LINE_ITEM_EDIT_COLUMNS = {
+    "description": "description",
+    "quantity": "quantity",
+    "unit_price": "unit_price_paisa",
+    "amount": "amount_paisa",
+}
+SNAPSHOT_COLUMNS = ("line_no", "description", "quantity", "unit_price_paisa", "amount_paisa")
+
+
+def _contains_pattern(text: str) -> str:
+    """ILIKE pattern for "contains `text`", with the user's own % and _ matched literally."""
+    escaped = text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
+
+
+def find_line_items(
+    conn: psycopg.Connection, *, receipt_id: int | None = None, merchant: str | None = None,
+    invoice_number: str | None = None, item: str | None = None, line_no: int | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Line items (with their receipt's merchant, invoice number and date) matching EVERY given
+    filter, newest receipt first. merchant/item are case-insensitive "contains"; the invoice
+    number is matched exactly (ignoring case and surrounding spaces). Read only."""
+    clauses, params = [], {"limit": limit}
+    if receipt_id is not None:
+        clauses.append("r.id = %(receipt_id)s")
+        params["receipt_id"] = receipt_id
+    if merchant:
+        clauses.append("r.merchant_name ILIKE %(merchant)s")
+        params["merchant"] = _contains_pattern(merchant)
+    if invoice_number:
+        clauses.append("lower(btrim(r.invoice_number)) = lower(btrim(%(invoice_number)s))")
+        params["invoice_number"] = invoice_number
+    if item:
+        clauses.append("li.description ILIKE %(item)s")
+        params["item"] = _contains_pattern(item)
+    if line_no is not None:
+        clauses.append("li.line_no = %(line_no)s")
+        params["line_no"] = line_no
+    where = " AND ".join(clauses) or "TRUE"  # fixed fragments only; every value is a parameter
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT li.id AS line_item_id, li.receipt_id, li.line_no, li.description, li.quantity,"
+            " li.unit_price_paisa, li.amount_paisa, r.merchant_name, r.invoice_number, r.date_ad"
+            f" FROM line_items li JOIN receipts r ON r.id = li.receipt_id WHERE {where}"
+            " ORDER BY r.date_ad DESC, r.id DESC, li.line_no LIMIT %(limit)s",
+            params,
+        )
+        return cur.fetchall()
+
+
+_INSERT_EDIT_PROPOSAL = """
+    INSERT INTO line_item_edits (
+        id, session_id, receipt_id, line_item_id, line_no, field, row_snapshot,
+        old_value, new_value, request_text, expires_at
+    ) VALUES (
+        %(id)s, %(session_id)s, %(receipt_id)s, %(line_item_id)s, %(line_no)s, %(field)s,
+        %(row_snapshot)s, %(old_value)s, %(new_value)s, %(request_text)s, %(expires_at)s
+    )
+"""
+
+
+def insert_edit_proposals(conn: psycopg.Connection, proposals: list[dict[str, Any]]) -> None:
+    """Record 'pending' proposals (keys = _INSERT_EDIT_PROPOSAL's placeholders). Touches no bill."""
+    json_columns = ("row_snapshot", "old_value", "new_value")
+    with conn.cursor() as cur:
+        cur.executemany(_INSERT_EDIT_PROPOSAL, [
+            {**p, **{column: Jsonb(p[column]) for column in json_columns}} for p in proposals
+        ])
+
+
+def lock_edit_proposal(conn: psycopg.Connection, proposal_id: UUID, session_id: str) -> dict[str, Any] | None:
+    """The proposal, row-locked until the transaction ends, if it belongs to `session_id`.
+
+    The lock serialises concurrent decisions on one proposal (double click, two tabs):
+    the second waits, then sees the first one's final status.
+    """
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            "SELECT * FROM line_item_edits WHERE id = %s AND session_id = %s FOR UPDATE",
+            (proposal_id, session_id),
+        )
+        return cur.fetchone()
+
+
+def set_edit_proposal_status(
+    conn: psycopg.Connection, proposal_id: UUID, status: str, decided_at: datetime
+) -> None:
+    """Move a pending proposal to its final status. A decided proposal is never changed again."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE line_item_edits SET status = %s, decided_at = %s WHERE id = %s AND status = 'pending'",
+            (status, decided_at, proposal_id),
+        )
+        if cur.rowcount != 1:
+            raise LookupError(f"proposal {proposal_id} is not pending")
+
+
+def update_line_item_field(
+    conn: psycopg.Connection, *, receipt_id: int, line_item_id: int, field: str,
+    new_value: Any, snapshot: dict[str, Any],
+) -> bool:
+    """Set ONE column of ONE line item, only if the whole line still equals `snapshot`.
+
+    Returns False (and changes nothing) if the line is gone, moved to another receipt, or
+    any of its values differ from the snapshot. No other row or column is written.
+    """
+    column = LINE_ITEM_EDIT_COLUMNS[field]  # KeyError for anything else: never interpolate input
+    with conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE line_items SET {column} = %(new_value)s"
+            " WHERE id = %(line_item_id)s AND receipt_id = %(receipt_id)s AND line_no = %(line_no)s"
+            " AND description IS NOT DISTINCT FROM %(description)s"
+            " AND quantity IS NOT DISTINCT FROM %(quantity)s::real"
+            " AND unit_price_paisa IS NOT DISTINCT FROM %(unit_price_paisa)s"
+            " AND amount_paisa IS NOT DISTINCT FROM %(amount_paisa)s",
+            {**{c: snapshot[c] for c in SNAPSHOT_COLUMNS},
+             "new_value": new_value, "line_item_id": line_item_id, "receipt_id": receipt_id},
+        )
+        return cur.rowcount == 1
+
+
+def get_line_item(conn: psycopg.Connection, receipt_id: int, line_item_id: int) -> dict[str, Any] | None:
+    """One line item as it is now (SNAPSHOT_COLUMNS), or None if it no longer exists on that receipt."""
+    with conn.cursor(row_factory=dict_row) as cur:
+        cur.execute(
+            f"SELECT {', '.join(SNAPSHOT_COLUMNS)} FROM line_items WHERE id = %s AND receipt_id = %s",
+            (line_item_id, receipt_id),
+        )
+        return cur.fetchone()
+
+
+def set_receipt_status(conn: psycopg.Connection, receipt_id: int, status: str) -> None:
+    """Store a re-derived receipts.status; writes nothing when it is unchanged."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE receipts SET status = %(status)s WHERE id = %(id)s AND status IS DISTINCT FROM %(status)s",
+            {"status": status, "id": receipt_id},
+        )
+
+
+def refresh_audit_flags(
+    conn: psycopg.Connection, receipt_id: int, *, flags_at_save: list[dict[str, Any]], edited_fields: list[str]
+) -> None:
+    """Refresh receipt_audit's flags and edited fields after a line-item edit (the AI's side,
+    and confirmed_at, are kept)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE receipt_audit SET flags_at_save_json = %s, edited_fields_json = %s WHERE receipt_id = %s",
+            (Jsonb(flags_at_save), Jsonb(edited_fields), receipt_id),
+        )
 
 
 # --- Dashboard reads (ARCHITECTURE.md §3.10, Amendment A1; TASK-020) ---------

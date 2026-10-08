@@ -213,6 +213,49 @@ class Source(BaseModel):
     snippet: str
 
 
+# --- Ask Your Ledger: chat edits to saved line items (edit.py) ----------------
+
+EditField = Literal["description", "quantity", "unit_price", "amount"]
+
+
+class LineItemEditRequest(BaseModel):
+    """One change the LLM read from the user's request. Every value is text copied from the
+    request: edit.py checks that it really is in the request, then resolves and parses it."""
+
+    receipt_id: int | None = None            # "#12", "receipt 12"
+    merchant: str | None = None
+    invoice_number: str | None = None
+    item: str | None = None                  # words identifying the line, e.g. "rice"
+    line_no: int | None = None               # "line 2"
+    field: EditField
+    current_value: str | None = None         # "from 2" -- only if the user said it
+    new_value: str
+
+
+class EditPlan(BaseModel):
+    """From the LLM. It only reads the request; it never sees the ledger or changes anything."""
+
+    status: Literal["edit", "not_edit", "ambiguous", "unsupported"]
+    edits: list[LineItemEditRequest] = Field(default_factory=list)
+    clarification: str | None = None
+
+
+class EditProposal(BaseModel):
+    """A pending change, as shown on the confirmation card. Display only: Approve sends back
+    proposal_id alone, and the server re-reads the target and values from line_item_edits."""
+
+    proposal_id: str
+    receipt_id: int
+    merchant_name: str
+    invoice_number: str | None = None
+    date_ad: date
+    line_no: int
+    item: str | None = None                  # the line's description, for display
+    field: EditField
+    current_text: str                        # formatted by code (Rs, quantities), never the LLM
+    new_text: str
+
+
 class QueryResult(BaseModel):
     """To the UI and eval. Money in formatted_rows is formatted by code, never the LLM."""
 
@@ -227,5 +270,6 @@ class QueryResult(BaseModel):
     route: Literal["sql", "docs", "both"] | None = None  # hybrid strategy only
     answer: str | None = None                # from documents (and rows); only if it passed the number check
     sources: list[Source] = Field(default_factory=list)
+    edits: list[EditProposal] = Field(default_factory=list)  # proposed, NOT applied: each needs Approve
     prompt_version: str
     model_name: str
