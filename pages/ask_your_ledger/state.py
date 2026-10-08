@@ -14,13 +14,20 @@ whatever still escapes it (e.g. a missing DATABASE_URL_READONLY) -- it logs the
 exception type and a redacted message to the terminal and returns a message that
 differs by kind (config / database / LLM / query-building), never the
 exception's own text, which could name a host or a query.
+
+Edit requests ("change the quantity of rice on receipt #12 to 5") go to
+bahikhata/edit.py first: answering one only *proposes* the change. The bill is
+changed by decide(..., approve=True) alone, which the page calls only from that
+proposal's Approve button. Proposals are bound to this session's id, which is
+created here, kept server-side in session state, and never taken from the browser.
 """
 
 import logging
+import uuid
 
 import streamlit as st
 
-from bahikhata import ask, config, rag
+from bahikhata import ask, config, edit, rag
 from bahikhata.schemas import QueryResult
 
 logger = logging.getLogger(__name__)
@@ -34,6 +41,26 @@ def history() -> list[tuple[str, QueryResult]]:
 
 def record(question: str, result: QueryResult) -> None:
     history().append((question, result))
+
+
+def session_id() -> str:
+    """This chat session's id; proposals made here can only be decided here."""
+    return S.setdefault("ask_session_id", uuid.uuid4().hex)
+
+
+def edit_outcomes() -> dict[str, edit.EditOutcome]:
+    """proposal_id -> what happened when the user clicked Approve or Cancel on it."""
+    return S.setdefault("ask_edit_outcomes", {})
+
+
+def decide(proposal_id: str, approve: bool) -> None:
+    """Approve (apply) or cancel one proposal. edit.py re-checks everything server-side,
+    so a repeated click can't apply it twice."""
+    if approve:
+        outcome = edit.apply_edit(proposal_id, session_id())
+    else:
+        outcome = edit.cancel_edit(proposal_id, session_id())
+    edit_outcomes()[proposal_id] = outcome
 
 
 def add_uploads(files) -> list[rag.IngestResult]:
@@ -66,6 +93,10 @@ def delete_document(doc_id: str) -> str | None:
 
 def answer(question: str) -> QueryResult:
     try:
+        if edit.looks_like_edit(question):
+            proposed = edit.propose_edits(question, session_id())
+            if proposed is not None:
+                return proposed
         return ask.answer_question(question, ask.today(), strategy="hybrid")
     except Exception as exc:  # never show a traceback for an unexpected failure
         kind, user_message = ask.classify_error(exc)

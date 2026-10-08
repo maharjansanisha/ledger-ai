@@ -1,10 +1,18 @@
-"""Rendering for Ask Your Ledger: header, tips, documents sidebar, chat turns and answers."""
+"""Rendering for Ask Your Ledger: header, tips, documents sidebar, chat turns and answers.
+
+Proposed edits render as confirmation cards; render_answer/render_turn return the
+(proposal_id, approve) a card's button was clicked with, and the page acts on it.
+"""
+
+import re
 
 import pandas as pd
 import streamlit as st
 
-from bahikhata import rag
-from bahikhata.schemas import QueryResult
+from bahikhata import edit, rag
+from bahikhata.schemas import EditProposal, QueryResult
+
+EditDecision = tuple[str, bool]  # (proposal_id, True = Approve / False = Cancel)
 
 UPLOAD_FILE_TYPES = list(rag.SUPPORTED_EXTENSIONS)
 
@@ -13,7 +21,8 @@ def render_header(show_tips: bool, rag_enabled: bool) -> None:
     st.title("Ask Your Ledger")
     st.caption(
         "Ask about your saved receipts or the documents you attach. "
-        "Each question is answered on its own — there's no follow-up memory."
+        "Each question is answered on its own — there's no follow-up memory. "
+        "You can also ask to correct a saved line item; nothing changes until you approve it."
     )
     if not rag_enabled:
         st.caption(":material/info: Document search isn't configured, so attachments won't be searchable.")
@@ -21,7 +30,8 @@ def render_header(show_tips: bool, rag_enabled: bool) -> None:
         with st.container(border=True, key="card_tips"):
             st.markdown(
                 ":material/lightbulb: **Try asking** — “How much did I spend this month?” · "
-                "“Top 5 merchants by spend last month” · attach a budget or policy and ask about it"
+                "“Top 5 merchants by spend last month” · attach a budget or policy and ask about it · "
+                "“Change the quantity of rice on receipt #12 to 5” (you approve before anything changes)"
             )
 
 
@@ -40,7 +50,46 @@ def render_documents_sidebar(documents: list[dict]) -> str | None:
     return clicked
 
 
-def render_answer(result: QueryResult) -> None:
+_MARKDOWN_SPECIAL = re.compile(r"([\\`*_{}\[\]()#+\-.!|~<>$:])")
+
+
+def _md(text: str) -> str:
+    """Saved text (merchant, item names) shown literally inside markdown."""
+    return _MARKDOWN_SPECIAL.sub(r"\\\1", text)
+
+
+def render_edit_proposal(proposal: EditProposal, outcome: edit.EditOutcome | None) -> EditDecision | None:
+    """One pending change as a card with Approve / Cancel, or its outcome once decided."""
+    pid = proposal.proposal_id
+    with st.container(border=True, key=f"edit_{pid}"):
+        st.markdown(":material/edit_note: **Confirm change**" if outcome is None else ":material/edit_note: **Change**")
+        bill = [f"Receipt #{proposal.receipt_id}", _md(proposal.merchant_name)]
+        if proposal.invoice_number:
+            bill.append(_md(proposal.invoice_number))
+        bill.append(proposal.date_ad.isoformat())
+        st.markdown(" · ".join(bill))
+        item = f" — {_md(proposal.item)}" if proposal.item else ""
+        st.markdown(f"Items table, line {proposal.line_no}{item}")
+        st.markdown(f"**{edit.FIELD_LABELS[proposal.field]}:** {_md(proposal.current_text)} → "
+                    f"**{_md(proposal.new_text)}**")
+        if outcome is not None:
+            (st.success if outcome.applied else st.info)(outcome.message)
+            return None
+        st.caption("Only this one value changes. Nothing is saved until you approve.")
+        approve_col, cancel_col = st.columns(2)
+        if approve_col.button("Approve change", key=f"approve_{pid}", type="primary", icon=":material/check:",
+                              width="stretch"):
+            return pid, True
+        if cancel_col.button("Cancel", key=f"cancel_{pid}", icon=":material/close:", width="stretch"):
+            return pid, False
+    return None
+
+
+def render_answer(result: QueryResult, edit_outcomes: dict[str, edit.EditOutcome] | None = None) -> EditDecision | None:
+    decision = None
+    for proposal in result.edits:
+        decision = render_edit_proposal(proposal, (edit_outcomes or {}).get(proposal.proposal_id)) or decision
+
     if result.plan is not None and result.plan.date_range_start and result.plan.date_range_end:
         st.caption(f"Assumed date range: {result.plan.date_range_start} to {result.plan.date_range_end}")
 
@@ -65,6 +114,7 @@ def render_answer(result: QueryResult) -> None:
     if sql_shown:
         with st.expander("SQL" if result.sql_executed else "SQL (not run)"):
             st.code(sql_shown, language="sql")
+    return decision
 
 
 def _upload_line(upload: rag.IngestResult) -> str:
@@ -83,10 +133,12 @@ def render_question(question: str, uploads: list[rag.IngestResult] | None = None
             st.caption(_upload_line(upload))
 
 
-def render_turn(question: str, result: QueryResult) -> None:
+def render_turn(
+    question: str, result: QueryResult, edit_outcomes: dict[str, edit.EditOutcome] | None = None,
+) -> EditDecision | None:
     render_question(question)
     with st.chat_message("assistant"):
-        render_answer(result)
+        return render_answer(result, edit_outcomes)
 
 
 def render_chat_input():

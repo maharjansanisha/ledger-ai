@@ -6,6 +6,7 @@ chat wiring and rendering, not about ask.py's own logic, which tests/test_ask.py
 already covers. No network, no database.
 """
 
+from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,8 +14,8 @@ import psycopg
 import pytest
 from streamlit.testing.v1 import AppTest
 
-from bahikhata import ask, config, llm_client, rag
-from bahikhata.schemas import QueryPlan, QueryResult, Source
+from bahikhata import ask, config, edit, llm_client, rag
+from bahikhata.schemas import EditProposal, QueryPlan, QueryResult, Source
 from pages.ask_your_ledger import views
 
 PAGE = str(Path(__file__).resolve().parent.parent / "pages" / "ask_your_ledger" / "page.py")
@@ -234,3 +235,112 @@ def test_sidebar_lists_documents_and_deletes_one(monkeypatch):
     assert not at.exception
     assert deleted == ["d1"]
     assert any("None yet" in c.value for c in at.sidebar.caption)
+
+
+# --- Proposed line-item edits (bahikhata/edit.py) ------------------------------
+#
+# edit.propose_edits / apply_edit / cancel_edit are stubbed: these tests are about the
+# page's consent wiring. tests/test_edit.py covers the proposals and the SQL itself.
+
+EDIT_QUESTION = "Change the quantity of rice on receipt #12 from 2 to 5"
+PROPOSAL = EditProposal(
+    proposal_id="p-1", receipt_id=12, merchant_name="Shree Traders", invoice_number="INV-42",
+    date_ad=date(2026, 9, 30), line_no=1, item="Rice 25kg", field="quantity", current_text="2", new_text="5",
+)
+
+
+def start_with_edits(monkeypatch, proposed: dict[str, QueryResult | None], answers: dict[str, QueryResult] | None = None):
+    calls = {"propose": [], "apply": [], "cancel": [], "ask": []}
+
+    def propose(question, session_id, **kw):
+        calls["propose"].append(question)
+        return proposed[question]
+
+    def answer(question, today, **kw):
+        calls["ask"].append(question)
+        return answers[question]
+
+    def apply(proposal_id, session_id, **kw):
+        calls["apply"].append((proposal_id, session_id))
+        return edit.EditOutcome("applied", "Updated receipt #12, line 1 (Rice 25kg): quantity 2 → 5.")
+
+    def cancel(proposal_id, session_id, **kw):
+        calls["cancel"].append((proposal_id, session_id))
+        return edit.EditOutcome("cancelled", "Cancelled — nothing was changed.")
+
+    monkeypatch.setattr(edit, "propose_edits", propose)
+    monkeypatch.setattr(ask, "answer_question", answer)
+    monkeypatch.setattr(edit, "apply_edit", apply)
+    monkeypatch.setattr(edit, "cancel_edit", cancel)
+    at = AppTest.from_file(PAGE, default_timeout=30)
+    at.run()
+    return at, calls
+
+
+def proposed_result():
+    return QueryResult(question=EDIT_QUESTION, edits=[PROPOSAL], prompt_version=config.EDIT_PROMPT,
+                       model_name=config.MODEL_NAME)
+
+
+def markdown_text(at) -> str:
+    return "\n".join(m.value for m in at.markdown)
+
+
+def test_edit_request_shows_a_confirmation_card_and_applies_nothing(monkeypatch):
+    at, calls = start_with_edits(monkeypatch, {EDIT_QUESTION: proposed_result()})
+    at = ask_question(at, EDIT_QUESTION)
+    assert not at.exception
+    text = markdown_text(at)
+    assert "Confirm change" in text and "Receipt #12" in text and "line 1" in text
+    assert "**Quantity:** 2 → **5**" in text
+    assert at.button(key="approve_p-1").label == "Approve change"
+    assert at.button(key="cancel_p-1").label == "Cancel"
+    assert calls["apply"] == [] and calls["cancel"] == [] and calls["ask"] == []
+
+
+def test_approve_applies_exactly_that_proposal_once_for_this_session(monkeypatch):
+    at, calls = start_with_edits(monkeypatch, {EDIT_QUESTION: proposed_result()})
+    at = ask_question(at, EDIT_QUESTION)
+    at = at.button(key="approve_p-1").click().run()
+    assert not at.exception
+    assert calls["apply"] == [("p-1", at.session_state["ask_session_id"])]
+    assert any("quantity 2 → 5" in s.value for s in at.success)
+    assert not [b for b in at.button if b.key in ("approve_p-1", "cancel_p-1")]  # decided: no more buttons
+    at.run()  # later reruns render the outcome, never re-apply
+    assert len(calls["apply"]) == 1
+
+
+def test_cancel_applies_nothing(monkeypatch):
+    at, calls = start_with_edits(monkeypatch, {EDIT_QUESTION: proposed_result()})
+    at = ask_question(at, EDIT_QUESTION)
+    at = at.button(key="cancel_p-1").click().run()
+    assert not at.exception
+    assert calls["apply"] == [] and calls["cancel"] == [("p-1", at.session_state["ask_session_id"])]
+    assert any("nothing was changed" in i.value for i in at.info)
+
+
+def test_edit_words_that_are_not_an_edit_fall_through_to_answering(monkeypatch):
+    question = "What did I fix up at the garage last month?"
+    answer = QueryResult(question=question, message="No matching records.", **BASE)
+    at, calls = start_with_edits(monkeypatch, {question: None}, {question: answer})
+    at = ask_question(at, question)
+    assert calls["propose"] == [question] and calls["ask"] == [question]
+    assert any("No matching records." in i.value for i in at.info)
+
+
+def test_plain_questions_never_reach_the_edit_planner(monkeypatch):
+    question = "How much did I spend this month?"
+    answer = QueryResult(question=question, message="No matching records.", **BASE)
+    at, calls = start_with_edits(monkeypatch, {}, {question: answer})
+    ask_question(at, question)
+    assert calls["propose"] == [] and calls["ask"] == [question]
+
+
+def test_typing_yes_in_the_chat_does_not_approve_a_pending_change(monkeypatch):
+    reply = "Yes, go ahead and apply it"
+    answer = QueryResult(question=reply, message="I can only answer questions about your saved receipts.", **BASE)
+    at, calls = start_with_edits(monkeypatch, {EDIT_QUESTION: proposed_result()}, {reply: answer})
+    at = ask_question(at, EDIT_QUESTION)
+    at = ask_question(at, reply)
+    assert calls["apply"] == []
+    assert at.button(key="approve_p-1").label == "Approve change"  # still waiting for the click
