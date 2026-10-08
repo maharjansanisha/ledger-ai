@@ -7,9 +7,12 @@ Two phases, enforced by code -- the prompt is not the safety boundary:
    the ledger. Python then checks that every value the LLM returned is actually in
    the request (so it cannot widen the scope or invent a target), resolves each edit
    to exactly ONE line item with fixed, parameterised reads, and records a 'pending'
-   row in line_item_edits. Nothing here writes to receipts, line_items or
-   receipt_audit. Unclear, ambiguous and bulk requests get a question, not a guess;
-   if any edit in a request can't be resolved, none of them is proposed.
+   row in line_item_edits. The bill is grounded by the server, not the LLM: a receipt
+   number counts only if the user wrote it as one ("receipt #12") or it comes from
+   trusted server-side context (ground_receipt); the model's own receipt_id is just a
+   cross-check, so it cannot redirect an edit to another bill. Nothing here writes to
+   receipts, line_items or receipt_audit. Unclear, ambiguous and bulk requests get a
+   question, not a guess; if any edit in a request can't be resolved, none is proposed.
 
 2. apply_edit / cancel_edit(proposal_id, session_id) -- called ONLY from the page's
    Approve / Cancel buttons, never on the LLM path. They take nothing but the proposal
@@ -21,6 +24,13 @@ Two phases, enforced by code -- the prompt is not the safety boundary:
    re-derives receipts.status and the audit flags with the same validator the review
    form uses, and marks the proposal applied. A proposal is applied at most once.
 
+Proposal lifecycle (line_item_edits.status; migration 0004 makes the end states final
+in the database too): pending -> applied | cancelled | stale | expired. Only a pending,
+unexpired proposal can be applied. Expired proposals are marked 'expired' (never
+deleted: the row is the change record) whenever a new edit is proposed, and by
+apply/cancel for the one they touch; approval checks expires_at itself, so it is safe
+even if that cleanup never ran.
+
 Derived values follow the existing rules: the validator detects and never corrects
 (validate.py), so changing a quantity does not change the amount -- a mismatch shows
 up as a V3 warning and receipts.status is re-derived from the flags.
@@ -29,6 +39,7 @@ There are no user accounts in this MVP (single user): a proposal belongs to the 
 session that created it (Streamlit session state, held server-side).
 """
 
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -45,6 +56,8 @@ from bahikhata.normalize import format_npr, parse_amount_to_paisa, parse_quantit
 from bahikhata.review import receipt_to_draft
 from bahikhata.schemas import EditField, EditPlan, EditProposal, LineItemEditRequest, QueryResult, ReceiptDraft
 from bahikhata.validate import validate_draft
+
+logger = logging.getLogger(__name__)
 
 FIELD_LABELS: dict[EditField, str] = {
     "description": "Description", "quantity": "Quantity", "unit_price": "Unit price", "amount": "Amount",
@@ -64,6 +77,12 @@ _NOT_IN_REQUEST = (
     f"Please name the item, the field and the new value, {_EXAMPLE}."
 )
 _NEEDS_TARGET = f"Which item should I change? Name it or give its line number, {_EXAMPLE}."
+_SEVERAL_RECEIPTS = ("Your message mentions more than one receipt ({}), so I can't tell which bill to change "
+                     "and nothing was proposed. Please ask about one receipt at a time, naming only that one.")
+_UNSURE_RECEIPT = ("I wasn't sure receipt #{} is the bill you want to change, so nothing was proposed. "
+                   f"Please say it plainly, {_EXAMPLE}.")
+_CONTEXT_CONFLICT = ("You're working on receipt #{}, but your message names receipt #{}. Nothing was proposed — "
+                     "please make the change from that receipt, or name only the one you're working on.")
 _DB_UNREACHABLE = "I couldn't reach your ledger database right now — nothing was changed. Please try again."
 
 # --- Request gate ---------------------------------------------------------------
@@ -123,26 +142,73 @@ def _numbers_in(text: str) -> set[str]:
     return {match.replace(",", "") for match in _NUMBER_RE.findall(text)}
 
 
+# How a user names a bill: "receipt #12", "receipt 12", "receipt no. 12", "bill #12", or a bare
+# "#12" (how the app itself shows receipts). "line #2" / "row #2" name a line, not a bill.
+_RECEIPT_REF = re.compile(
+    r"\b(?:receipt|bill)s?\s*(?:no\.?|number)?\s*#?\s*(\d+)\b|(?<!line )(?<!line)(?<!row )(?<!row)#\s*(\d+)\b",
+    re.IGNORECASE,
+)
+_LINE_REF = re.compile(r"\b(?:line|row)s?\s*(?:no\.?|number)?\s*#?\s*(\d+)\b", re.IGNORECASE)
+
+
+def receipt_refs(request: str) -> set[int]:
+    """Receipt numbers the user wrote AS receipt numbers. A number elsewhere ("price to 12") is not one."""
+    return {int(a or b) for a, b in _RECEIPT_REF.findall(request)}
+
+
+def line_refs(request: str) -> set[int]:
+    """Line numbers the user wrote as line numbers ("line 2", "row 2")."""
+    return {int(n) for n in _LINE_REF.findall(request)}
+
+
 def outside_request(edit: LineItemEditRequest, request: str) -> bool:
     """True if the LLM returned a target or value the request doesn't contain. Pure function.
 
-    Text (merchant, invoice, item, a description) must appear in the request; ids and
-    numeric values must be numbers the user typed. This is what stops a hallucinated or
-    over-eager plan from proposing a change to a line or value nobody asked about.
+    Text (merchant, invoice, item, a description) must appear in the request; a receipt or
+    line number must be one the user wrote as a receipt or line number; numeric values must
+    be numbers the user typed. This is what stops a hallucinated or over-eager plan from
+    proposing a change to a bill, line or value nobody asked about.
     """
     texts = [edit.merchant, edit.invoice_number, edit.item]
     if edit.field == "description":
         texts += [edit.new_value, edit.current_value]
     if any(text is not None and not _mentioned(text, request) for text in texts):
         return True
-    numbers = _numbers_in(request)
-    if any(n is not None and str(n) not in numbers for n in (edit.receipt_id, edit.line_no)):
+    if edit.receipt_id is not None and edit.receipt_id not in receipt_refs(request):
         return True
+    if edit.line_no is not None and edit.line_no not in line_refs(request):
+        return True
+    numbers = _numbers_in(request)
     if edit.field != "description":
         for value in (edit.new_value, edit.current_value):
             if value is not None and not (_numbers_in(value) and _numbers_in(value) <= numbers):
                 return True
     return False
+
+
+def ground_receipt(
+    edits: list[LineItemEditRequest], request: str, active_receipt_id: int | None = None,
+) -> tuple[int | None, str | None]:
+    """The one receipt every edit must be on, decided by the server -> (receipt_id, None), or
+    (None, a question for the user) when the bill isn't clearly grounded. Pure function.
+
+    The receipt comes from what the user wrote as a receipt number, or from
+    `active_receipt_id` (trusted server-side context only, never a value from the browser).
+    The LLM's receipt_id is only a cross-check and never chooses the bill. A receipt of None
+    means the user named none (only a merchant or invoice, or nothing): the line must then
+    still resolve to exactly one row in the whole ledger.
+    """
+    named = receipt_refs(request)
+    if len(named) > 1:  # e.g. one mentioned in passing, one to change: never guess which
+        return None, _SEVERAL_RECEIPTS.format(", ".join(f"#{n}" for n in sorted(named)))
+    if active_receipt_id is not None and named and named != {active_receipt_id}:
+        return None, _CONTEXT_CONFLICT.format(active_receipt_id, next(iter(named)))
+    grounded = next(iter(named)) if named else active_receipt_id
+    if any(e.receipt_id is not None and e.receipt_id != grounded for e in edits):
+        return None, _NOT_IN_REQUEST  # the model names a bill the user didn't
+    if named and any(e.receipt_id is None for e in edits):
+        return None, _UNSURE_RECEIPT.format(grounded)  # the user named one, the model didn't take it as the target
+    return grounded, None
 
 
 def parse_value(field: EditField, text: str) -> Any:
@@ -240,13 +306,16 @@ def _resolve(conn: psycopg.Connection, edit: LineItemEditRequest) -> tuple[dict[
 
 
 def propose_edits(
-    question: str, session_id: str, *, now: datetime | None = None, client=None,
-    connect: Callable[[], psycopg.Connection] | None = None,
+    question: str, session_id: str, *, active_receipt_id: int | None = None, now: datetime | None = None,
+    client=None, connect: Callable[[], psycopg.Connection] | None = None,
 ) -> QueryResult | None:
     """An edit request -> a QueryResult carrying pending EditProposals (or a question / refusal).
 
     Returns None when the message isn't an edit request, so the caller answers it as a
-    question instead. Never changes a bill: the only write is the 'pending' proposal rows.
+    question instead. Never changes a bill: the only writes are the new 'pending' proposal
+    rows and marking expired ones 'expired'. `active_receipt_id` is the receipt the user is
+    working on, if the caller knows it from trusted server-side state (see ground_receipt);
+    the Ask page has no such context and passes None.
     """
     base = {"question": question, "prompt_version": config.EDIT_PROMPT, "model_name": config.MODEL_NAME}
     stripped = question.strip()
@@ -270,6 +339,10 @@ def propose_edits(
         return QueryResult(**base, message=_NEEDS_TARGET)
     if any(outside_request(e, stripped) for e in edits):
         return QueryResult(**base, message=_NOT_IN_REQUEST)
+    receipt_id, problem = ground_receipt(edits, stripped, active_receipt_id)
+    if problem:
+        return QueryResult(**base, message=problem)
+    edits = [e.model_copy(update={"receipt_id": receipt_id}) for e in edits]  # the server's receipt, not the model's
     new_values = [parse_value(e.field, e.new_value) for e in edits]
     for edit, value in zip(edits, new_values):
         if value is None:
@@ -279,6 +352,7 @@ def propose_edits(
     now = now or datetime.now(timezone.utc)
     try:
         with (connect or db.get_connection)() as conn:
+            db.expire_edit_proposals(conn, now)  # request-time cleanup; committed even if nothing is proposed
             resolved = []
             for edit, value in zip(edits, new_values):
                 row, problem = _resolve(conn, edit)
@@ -287,7 +361,8 @@ def propose_edits(
                 if _same(edit.field, _cell(row, edit.field), value):
                     return QueryResult(**base, message=(
                         f"The {FIELD_LABELS[edit.field].lower()} of receipt #{row['receipt_id']} line "
-                        f"{row['line_no']} is already {display_value(edit.field, value)}, so there's nothing to change."))
+                        f"{row['line_no']} is already {display_value(edit.field, value)}, "
+                        "so there's nothing to change."))
                 resolved.append((edit.field, row, value))
             if len({(row["line_item_id"], field) for field, row, _ in resolved}) < len(resolved):
                 return QueryResult(**base, message="That asks to change the same value more than once — "
@@ -303,7 +378,7 @@ def propose_edits(
                     "line_item_id": row["line_item_id"], "line_no": row["line_no"], "field": field,
                     "row_snapshot": {column: row[column] for column in db.SNAPSHOT_COLUMNS},
                     "old_value": _to_json(field, current), "new_value": _to_json(field, value),
-                    "request_text": stripped, "expires_at": expires_at,
+                    "request_text": stripped, "created_at": now, "expires_at": expires_at,
                 })
                 proposals.append(EditProposal(
                     proposal_id=str(proposal_id), receipt_id=row["receipt_id"], merchant_name=row["merchant_name"],
@@ -390,8 +465,8 @@ def apply_edit(
                 return _UNAVAILABLE
             if proposal["status"] != "pending":
                 return _ALREADY[proposal["status"]]
-            if proposal["expires_at"] <= now:
-                db.set_edit_proposal_status(conn, pid, "expired", now)
+            if proposal["expires_at"] <= now:  # enforced here even if cleanup never ran
+                db.set_edit_proposal_status(conn, pid, "expired", proposal["expires_at"])
                 return _EXPIRED
             field = proposal["field"]
             new_value = _from_json(field, proposal["new_value"])
@@ -405,7 +480,8 @@ def apply_edit(
                 return _stale(proposal, db.get_line_item(conn, proposal["receipt_id"], proposal["line_item_id"]))
             old_status, new_status = _rederive(conn, proposal["receipt_id"], today or date.today())
             db.set_edit_proposal_status(conn, pid, "applied", now)
-    except (psycopg.Error, RuntimeError, LookupError):
+    except (psycopg.Error, RuntimeError, LookupError) as exc:  # rolled back: nothing was changed
+        logger.error("Chat edit %s not applied: %s", pid, type(exc).__name__)
         return _FAILED
     item = proposal["row_snapshot"]["description"]
     message = (f"Updated receipt #{proposal['receipt_id']}, line {proposal['line_no']}"

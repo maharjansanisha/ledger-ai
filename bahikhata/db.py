@@ -273,10 +273,10 @@ def find_line_items(
 _INSERT_EDIT_PROPOSAL = """
     INSERT INTO line_item_edits (
         id, session_id, receipt_id, line_item_id, line_no, field, row_snapshot,
-        old_value, new_value, request_text, expires_at
+        old_value, new_value, request_text, created_at, expires_at
     ) VALUES (
         %(id)s, %(session_id)s, %(receipt_id)s, %(line_item_id)s, %(line_no)s, %(field)s,
-        %(row_snapshot)s, %(old_value)s, %(new_value)s, %(request_text)s, %(expires_at)s
+        %(row_snapshot)s, %(old_value)s, %(new_value)s, %(request_text)s, %(created_at)s, %(expires_at)s
     )
 """
 
@@ -288,6 +288,19 @@ def insert_edit_proposals(conn: psycopg.Connection, proposals: list[dict[str, An
         cur.executemany(_INSERT_EDIT_PROPOSAL, [
             {**p, **{column: Jsonb(p[column]) for column in json_columns}} for p in proposals
         ])
+
+
+def expire_edit_proposals(conn: psycopg.Connection, now: datetime) -> int:
+    """Mark every pending proposal whose expires_at has passed as 'expired' (decided at its
+    expiry time); returns how many. Rows are kept as the change record. Idempotent: an
+    already-decided proposal is never touched again."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE line_item_edits SET status = 'expired', decided_at = expires_at"
+            " WHERE status = 'pending' AND expires_at <= %s",
+            (now,),
+        )
+        return cur.rowcount
 
 
 def lock_edit_proposal(conn: psycopg.Connection, proposal_id: UUID, session_id: str) -> dict[str, Any] | None:
@@ -324,7 +337,9 @@ def update_line_item_field(
     """Set ONE column of ONE line item, only if the whole line still equals `snapshot`.
 
     Returns False (and changes nothing) if the line is gone, moved to another receipt, or
-    any of its values differ from the snapshot. No other row or column is written.
+    any of its values differ from the snapshot. No other row or column is written. Any
+    other row count is an invariant violation: it raises, so the caller's transaction
+    rolls back and the change is never reported as done.
     """
     column = LINE_ITEM_EDIT_COLUMNS[field]  # KeyError for anything else: never interpolate input
     with conn.cursor() as cur:
@@ -338,6 +353,8 @@ def update_line_item_field(
             {**{c: snapshot[c] for c in SNAPSHOT_COLUMNS},
              "new_value": new_value, "line_item_id": line_item_id, "receipt_id": receipt_id},
         )
+        if cur.rowcount not in (0, 1):
+            raise RuntimeError(f"line item update matched {cur.rowcount} rows; expected at most 1")
         return cur.rowcount == 1
 
 

@@ -9,8 +9,10 @@ tests/test_db.py: skipped if unset, refused unless the database name ends in "_t
 import json
 import os
 import threading
+from types import SimpleNamespace
 from datetime import date, datetime, timedelta, timezone
 
+import psycopg
 import pytest
 from psycopg.conninfo import conninfo_to_dict
 
@@ -81,7 +83,8 @@ def test_outside_request_rejects_anything_the_user_did_not_write(fields, outside
 def test_outside_request_for_a_description_needs_the_new_text_in_the_request():
     request = "Rename line 2 on receipt #12 to Basmati rice"
     ok = edit.LineItemEditRequest(**change(line_no=2, receipt_id=12, field="description", new_value="basmati rice"))
-    invented = edit.LineItemEditRequest(**change(line_no=2, receipt_id=12, field="description", new_value="Jasmine rice"))
+    invented = edit.LineItemEditRequest(**change(line_no=2, receipt_id=12, field="description",
+                                                 new_value="Jasmine rice"))
     assert not edit.outside_request(ok, request)
     assert edit.outside_request(invented, request)
 
@@ -406,7 +409,8 @@ def test_tampered_card_values_cannot_redirect_the_change(ledger, conn):
     """Approve sends back the proposal id only; whatever the client holds about the target is
     ignored, and the stored proposal is applied exactly as proposed."""
     result = propose(*RICE_2_TO_5)
-    result.edits[0].receipt_id, result.edits[0].line_no, result.edits[0].new_text = 2, 1, "999"
+    card = result.edits[0]
+    card.receipt_id, card.line_no, card.field, card.current_text, card.new_text = 2, 3, "amount", "4", "999"
     assert approve(result).applied
     assert quantities(conn) == [(1, 1, "Rice", 5.0), (1, 2, "Rice", 3.0), (1, 3, "Wheat", 4.0), (2, 1, "Rice", 2.0)]
 
@@ -461,7 +465,8 @@ def test_several_explicitly_named_rows_become_separate_proposals(ledger, conn):
         [{"receipt_id": 1, "item": "wheat", "new_value": "6"},
          {"receipt_id": 1, "line_no": 2, "field": "amount", "new_value": "Rs 1,600"}],
     )
-    assert [(p.line_no, p.field, p.new_text) for p in result.edits] == [(3, "quantity", "6"), (2, "amount", "Rs 1,600.00")]
+    assert [(p.line_no, p.field, p.new_text) for p in result.edits] == [
+        (3, "quantity", "6"), (2, "amount", "Rs 1,600.00")]
     assert all(approve(result, i).applied for i in range(2))
     rows = conn.execute("SELECT receipt_id, line_no, quantity, amount_paisa FROM line_items ORDER BY id").fetchall()
     assert rows == [(1, 1, 2.0, 100000), (1, 2, 3.0, 160000), (1, 3, 6.0, 100000), (2, 1, 2.0, 100000)]
@@ -500,3 +505,255 @@ def test_update_line_item_field_needs_the_exact_receipt_and_line(ledger, conn):
         assert not db.update_line_item_field(conn, receipt_id=2, line_item_id=line_id, field="quantity",
                                              new_value=9.0, snapshot=snapshot)
     assert all(q != 9.0 for *_, q in quantities(conn))
+
+
+
+# --- Receipt grounding: the server picks the bill, never the LLM ---------------------
+
+@pytest.mark.parametrize("request_text, expected", [
+    ("Change rice on receipt #12 to 5", {12}),
+    ("change rice on Receipt 12 to 5", {12}),
+    ("bill no. 7, line 2: set quantity to 3", {7}),
+    ("on #5 set line 2 to 3", {5}),
+    ("set line #2 on receipt 4 to 3", {4}),
+    ("Change the rice price to 120", set()),          # a number that isn't a receipt number
+    ("receipt 100 earlier; now receipt 200 rice to 100", {100, 200}),
+])
+def test_receipt_refs_only_counts_numbers_written_as_receipt_numbers(request_text, expected):
+    assert edit.receipt_refs(request_text) == expected
+
+
+def test_line_refs():
+    assert edit.line_refs("set line #2 and row 3 on receipt 4 to 5") == {2, 3}
+
+
+def req(**fields):
+    return edit.LineItemEditRequest(**change(**fields))
+
+
+@pytest.mark.parametrize("request_text, edits, active, expected_receipt, problem", [
+    ("Change rice on receipt #2 to 5", [req(item="rice", receipt_id=2)], None, 2, None),
+    ("Change rice to 5", [req(item="rice")], None, None, None),                       # no bill named
+    ("Change rice to 5", [req(item="rice", receipt_id=2)], None, None, "haven't proposed"),  # invented
+    ("Change rice on receipt #1 to 2", [req(item="rice", receipt_id=2)], None, None, "haven't proposed"),
+    ("Seen receipt 1; change rice on receipt 2 to 5", [req(item="rice", receipt_id=2)], None, None, "more than one"),
+    ("Change rice on receipt #2 to 5", [req(item="rice")], None, None, "wasn't sure"),  # model dropped it
+    ("Change rice to 5", [req(item="rice")], 2, 2, None),                              # trusted context
+    ("Change rice on receipt #2 to 5", [req(item="rice", receipt_id=2)], 2, 2, None),
+    ("Change rice on receipt #1 to 5", [req(item="rice", receipt_id=1)], 2, None, "working on receipt #2"),
+    ("Change rice to 5", [req(item="rice", receipt_id=1)], 2, None, "haven't proposed"),
+])
+def test_ground_receipt(request_text, edits, active, expected_receipt, problem):
+    receipt_id, message = edit.ground_receipt(edits, request_text, active)
+    assert receipt_id == expected_receipt
+    assert (message is None) if problem is None else (problem in message)
+
+
+@requires_test_db
+def test_grounding_a_invented_receipt_proposes_nothing(ledger, conn):
+    before = tables(conn)
+    result = propose("Change wheat quantity to 6", [{"receipt_id": 2, "item": "wheat", "new_value": "6"}])
+    assert result.edits == [] and proposal_statuses(conn) == [] and tables(conn) == before
+
+
+@requires_test_db
+def test_grounding_f_receipt_number_that_only_coincides_with_another_number(ledger, conn):
+    """'1' is in the message, but as a quantity: the model can't use it to pick receipt #1."""
+    result = propose("Change wheat quantity to 1", [{"receipt_id": 1, "item": "wheat", "new_value": "1"}])
+    assert result.edits == [] and proposal_statuses(conn) == []
+
+
+@requires_test_db
+@pytest.mark.parametrize("llm_receipt", [1, 2])
+def test_grounding_b_receipt_mentioned_in_passing_is_never_picked(ledger, conn, llm_receipt):
+    question = "I was looking at receipt 1 while discussing another bill. Change the rice price on receipt 2 to 100."
+    result = propose(question, [{"receipt_id": llm_receipt, "item": "rice", "field": "unit_price", "new_value": "100"}])
+    assert result.edits == [] and "more than one receipt (#1, #2)" in result.message
+    assert proposal_statuses(conn) == []
+
+
+@requires_test_db
+def test_grounding_named_receipt_the_model_did_not_target_is_a_question(ledger, conn):
+    result = propose("Change rice on receipt #2 quantity to 5", [{"item": "rice", "new_value": "5"}])
+    assert result.edits == [] and "wasn't sure receipt #2" in result.message
+
+
+@requires_test_db
+def test_grounding_c_same_merchant_on_two_receipts_asks_which(ledger, conn):
+    save(conn, "Shree Traders", "INV-3", [_line("Rice", 2, 50000)])
+    result = propose("Change rice quantity on the Shree Traders bill from 2 to 5",
+                     [{"merchant": "Shree Traders", "item": "rice", "current_value": "2", "new_value": "5"}])
+    assert result.edits == [] and "more than one line" in result.message
+    assert "receipt #1" in result.message and "receipt #3" in result.message
+    assert proposal_statuses(conn) == []
+
+
+@requires_test_db
+def test_grounding_d_trusted_active_receipt_resolves_the_line(ledger, conn):
+    """Without context "Rice" is on several bills; with receipt #2 as trusted context it is one line."""
+    result = edit.propose_edits("Change Rice quantity to 5", SESSION, active_receipt_id=2, now=NOW,
+                                client=FakeClient(plan(edits=[{"item": "Rice", "new_value": "5"}])), connect=connect)
+    assert [(p.receipt_id, p.line_no) for p in result.edits] == [(2, 1)]
+    stored, = conn.execute("SELECT receipt_id, line_item_id FROM line_item_edits").fetchall()
+    assert stored == (2, conn.execute("SELECT id FROM line_items WHERE receipt_id = 2").fetchone()[0])
+    assert approve(result).applied
+    assert quantities(conn) == [(1, 1, "Rice", 2.0), (1, 2, "Rice", 3.0), (1, 3, "Wheat", 4.0), (2, 1, "Rice", 5.0)]
+
+
+@requires_test_db
+def test_grounding_d_model_cannot_redirect_away_from_the_active_receipt(ledger, conn):
+    result = edit.propose_edits("Change Rice quantity to 5", SESSION, active_receipt_id=2, now=NOW,
+                                client=FakeClient(plan(edits=[{"receipt_id": 1, "item": "Rice", "new_value": "5"}])),
+                                connect=connect)
+    assert result.edits == [] and proposal_statuses(conn) == []
+
+
+@requires_test_db
+def test_line_number_that_only_coincides_with_a_value_is_rejected(ledger, conn):
+    result = propose("Set wheat quantity on receipt #1 to 2",
+                     [{"receipt_id": 1, "item": "wheat", "line_no": 2, "new_value": "2"}])
+    assert result.edits == [] and proposal_statuses(conn) == []
+
+
+# --- Expiry and cleanup ---------------------------------------------------------------
+
+TTL = timedelta(minutes=config.EDIT_PROPOSAL_TTL_MINUTES)
+
+
+def proposal_row(conn) -> dict:
+    with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
+        return cur.execute("SELECT * FROM line_item_edits").fetchone()
+
+
+@requires_test_db
+def test_expiry_a_proposal_within_its_ttl_stays_pending(ledger, conn):
+    propose(*RICE_2_TO_5)
+    assert db.expire_edit_proposals(conn, NOW + TTL - timedelta(seconds=1)) == 0
+    assert proposal_statuses(conn) == ["pending"]
+
+
+@requires_test_db
+def test_expiry_b_and_d_crossing_the_ttl_expires_it_and_keeps_the_record(ledger, conn):
+    propose(*RICE_2_TO_5)
+    before = proposal_row(conn)
+    assert db.expire_edit_proposals(conn, NOW + TTL) == 1
+    after = proposal_row(conn)
+    assert (after["status"], after["decided_at"]) == ("expired", before["expires_at"])
+    unchanged = {k: v for k, v in after.items() if k not in ("status", "decided_at")}
+    assert unchanged == {k: v for k, v in before.items() if k not in ("status", "decided_at")}
+    assert (after["request_text"], after["session_id"], after["source"]) == (RICE_2_TO_5[0], SESSION, "chat_agent")
+    assert (after["old_value"], after["new_value"], after["field"], after["receipt_id"]) == ("2", "5", "quantity", 1)
+
+
+@requires_test_db
+def test_expiry_c_and_e_expired_proposal_cannot_be_applied_and_cleanup_is_idempotent(ledger, conn):
+    before = tables(conn)
+    result = propose(*RICE_2_TO_5)
+    db.expire_edit_proposals(conn, NOW + TTL)
+    expired_row = proposal_row(conn)
+    assert db.expire_edit_proposals(conn, NOW + 2 * TTL) == 0
+    assert proposal_row(conn) == expired_row
+    assert approve(result, now=NOW + TTL).status == "expired"
+    assert tables(conn) == before and proposal_row(conn) == expired_row
+
+
+@requires_test_db
+def test_expiry_approval_enforces_it_even_if_cleanup_never_ran(ledger, conn):
+    before = tables(conn)
+    result = propose(*RICE_2_TO_5)
+    assert proposal_statuses(conn) == ["pending"]
+    assert approve(result, now=NOW + TTL).status == "expired"  # exactly at expires_at: already too late
+    assert tables(conn) == before and proposal_statuses(conn) == ["expired"]
+
+
+@requires_test_db
+def test_expiry_f_tampering_cannot_revive_an_expired_proposal(ledger, conn):
+    before = tables(conn)
+    result = propose(*RICE_2_TO_5)
+    db.expire_edit_proposals(conn, NOW + TTL)
+    result.edits[0].new_text = "5"
+    assert approve(result, now=NOW).status == "expired"  # even a client clock "before expiry" can't help
+    with pytest.raises(psycopg.errors.RaiseException, match="final"):
+        conn.execute("UPDATE line_item_edits SET status = 'pending', decided_at = NULL")
+    assert tables(conn) == before and proposal_statuses(conn) == ["expired"]
+
+
+@requires_test_db
+def test_proposing_sweeps_expired_proposals(ledger, conn):
+    propose(*RICE_2_TO_5)
+    edit.propose_edits("Set wheat quantity on receipt #1 to 6", SESSION, now=NOW + TTL, connect=connect,
+                       client=FakeClient(plan(edits=[{"receipt_id": 1, "item": "wheat", "new_value": "6"}])))
+    assert sorted(proposal_statuses(conn)) == ["expired", "pending"]
+
+
+@requires_test_db
+def test_proposing_sweeps_expired_proposals_even_when_nothing_is_proposed(ledger, conn):
+    propose(*RICE_2_TO_5)
+    result = edit.propose_edits("Change sugar quantity on receipt #1 to 2", SESSION, now=NOW + TTL, connect=connect,
+                                client=FakeClient(plan(edits=[{"receipt_id": 1, "item": "sugar", "new_value": "2"}])))
+    assert result.edits == [] and proposal_statuses(conn) == ["expired"]
+
+
+# --- Database-level invariants on line_item_edits --------------------------------------
+
+@requires_test_db
+def test_a_pending_proposal_target_and_values_are_immutable(ledger, conn):
+    result = propose(*RICE_2_TO_5)
+    for assignment in ("new_value = '\"9\"'::jsonb", "line_item_id = line_item_id + 1", "receipt_id = 2",
+                       "field = 'amount'", "expires_at = expires_at + interval '1 day'"):
+        with pytest.raises(psycopg.errors.RaiseException, match="only status and decided_at"):
+            conn.execute(f"UPDATE line_item_edits SET {assignment}")
+    assert approve(result).applied
+    assert quantities(conn)[0] == (1, 1, "Rice", 5.0)
+
+
+@requires_test_db
+def test_a_decided_proposal_is_final_in_the_database(ledger, conn):
+    approve(propose(*RICE_2_TO_5))
+    with pytest.raises(psycopg.errors.RaiseException, match="applied proposal is final"):
+        conn.execute("UPDATE line_item_edits SET status = 'cancelled'")
+
+
+@requires_test_db
+def test_decided_at_is_set_exactly_when_decided(ledger, conn):
+    propose(*RICE_2_TO_5)
+    with pytest.raises(psycopg.errors.CheckViolation):
+        conn.execute("UPDATE line_item_edits SET status = 'cancelled'")  # no decided_at
+
+
+# --- Affected-row invariant -------------------------------------------------------------
+
+def test_update_line_item_field_treats_more_than_one_row_as_a_failure():
+    class Cursor:
+        rowcount = 2
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, *args):
+            pass
+
+    snapshot = dict.fromkeys(db.SNAPSHOT_COLUMNS)
+    with pytest.raises(RuntimeError, match="matched 2 rows"):
+        db.update_line_item_field(SimpleNamespace(cursor=Cursor), receipt_id=1, line_item_id=1, field="quantity",
+                                  new_value=5.0, snapshot=snapshot)
+
+
+@requires_test_db
+def test_a_failed_invariant_rolls_back_and_is_not_reported_as_applied(ledger, conn, monkeypatch):
+    """Even if the write had happened before the invariant check failed, it is rolled back."""
+    before = tables(conn)
+    result = propose(*RICE_2_TO_5)
+    real_update = db.update_line_item_field
+
+    def update_then_fail(*args, **kwargs):
+        real_update(*args, **kwargs)
+        raise RuntimeError("line item update matched 2 rows; expected at most 1")
+
+    monkeypatch.setattr(db, "update_line_item_field", update_then_fail)
+    outcome = approve(result)
+    assert outcome.status == "failed" and not outcome.applied
+    assert tables(conn) == before and proposal_statuses(conn) == ["pending"]
