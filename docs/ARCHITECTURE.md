@@ -70,6 +70,26 @@ Everything else in Amendment A1: psycopg v3 for app code, `.env` variable names,
 
 ---
 
+## Amendment A3 — Chat edits to saved line items, with explicit approval (proposed 2026-10-08, pending approval)
+
+**Decision:** Ask Your Ledger can *propose* a change to one cell (description, quantity, unit price or amount) of a saved line item; the change is applied only when the user clicks **Approve change** on that proposal's card. Implemented in `bahikhata/edit.py`, migration `0003_line_item_edits`, prompt `edit_v1`.
+
+**Invariants (enforced in code, not by the prompt):**
+
+| Invariant | How |
+|---|---|
+| The LLM cannot mutate anything | Its only output is an `EditPlan` (JSON). `propose_edits` reads, checks and inserts a `pending` row into `line_item_edits`; it never writes `receipts`, `line_items` or `receipt_audit`. The text-to-SQL path is unchanged (read-only role + guard; `line_item_edits` is not in the guard's allowlist and has no `ledger_reader` grant). |
+| No scope expansion | Every target and value in the plan must literally appear in the user's request (`edit.outside_request`); each edit must resolve to exactly **one** line item, otherwise the user is asked to clarify; bulk, add/delete and bill-level edits are refused. If any edit in a request fails, none is proposed. |
+| Approval is bound to one proposal | Approve sends only the proposal id; the target and values are read back from `line_item_edits`, row-locked, and checked for session, `pending` status and expiry (`EDIT_PROPOSAL_TTL_MINUTES`). |
+| Exact, single-cell write | `db.update_line_item_field`: `UPDATE line_items SET <one allowlisted column> WHERE id AND receipt_id AND line_no` **and** every column equals the snapshot taken when proposed (compare-and-swap). A changed or re-saved line makes the proposal `stale`; nothing is overwritten. |
+| At most once | The row lock plus the `pending → applied` transition happen in the same transaction as the write; a second click (or a concurrent one) sees `applied`. |
+| Derived values | The validator still detects and never corrects: changing a quantity does not recompute the amount. `receipts.status` and `receipt_audit.flags_at_save_json` / `edited_fields_json` are re-derived in the same transaction, as the Dashboard's Edit does. |
+| Audit | `line_item_edits` keeps the request text, session, row snapshot, old and new value, status and timestamps, `source = 'chat_agent'`. |
+
+**Limitation:** the MVP has no user accounts, so "authorization" is the chat session that created the proposal (server-side Streamlit session state), not a user identity.
+
+---
+
 ## 1. Architecture Overview
 
 ### What the system does

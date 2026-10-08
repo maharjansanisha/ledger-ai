@@ -58,7 +58,7 @@ Flow: capture → validate → confirm → store → query.
    make migrate TARGET=eval   # ledger_eval
    ```
 
-   Migration `0002` grants `ledger_reader` `SELECT` on `receipts` and `line_items` only. `receipt_audit` stays unreadable to that role.
+   Migration `0002` grants `ledger_reader` `SELECT` on `receipts` and `line_items` only. `receipt_audit` stays unreadable to that role, as does `line_item_edits` (migration `0003`: chat edit proposals and their outcome).
 
 ## Run the app
 
@@ -70,7 +70,7 @@ Streamlit opens at http://localhost:8501. The home page shows whether your Gemin
 
 - **Capture and Review**: upload a receipt image, review the extracted draft, confirm to save
 - **Dashboard**: spending summaries from confirmed receipts
-- **Ask Your Ledger**: natural-language questions answered with guarded, read-only SQL, with an optional explanation of the result
+- **Ask Your Ledger**: natural-language questions answered with guarded, read-only SQL, with an optional explanation of the result. You can also ask it to correct one value on a saved line item (e.g. “Change the quantity of rice on receipt #12 from 2 to 5”): it shows the proposed change and nothing is saved until you click **Approve change** (see `docs/ARCHITECTURE.md` Amendment A3)
 
 ## Tests
 
