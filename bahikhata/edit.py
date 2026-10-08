@@ -94,6 +94,9 @@ _UNSURE_NAME = ("I wasn't sure “{}” is the bill you want to change, so nothi
 _DELETE_UNSUPPORTED = ("Deleting receipts or line items isn't supported from the chat, so nothing was proposed "
                        "or changed. I can only change the description, quantity, unit price or amount of a line "
                        "you name.")
+_MERCHANT_NAME_UNSUPPORTED = ("I can’t change the merchant/shop name from chat. Chat edits are limited to individual "
+                              "line items such as description, quantity, unit price, or amount. Please use Edit on "
+                              "the Dashboard to change the merchant name.")
 _BILL_LEVEL_UNSUPPORTED = ("Bill-level fields (merchant, date, totals, VAT, discount, category) can't be changed "
                            "from the chat, so nothing was proposed or changed — use Edit on the Dashboard for those. "
                            "I can only change the description, quantity, unit price or amount of a line you name.")
@@ -122,13 +125,41 @@ def looks_like_edit(question: str) -> bool:
     return bool(_EDIT_WORDS.search(question))
 
 
-def refusal_for(request: str) -> str | None:
-    """The refusal for a delete or bill-level request, or None. Pure function, independent of the LLM."""
+_MERCHANT_WORDS = re.compile(r"\b(?:merchant|seller|vendor)\b|\b(?:shop|store)\s+name\b", re.IGNORECASE)
+_NAME_WORDS = re.compile(r"\b(?:re)?name\b", re.IGNORECASE)
+
+
+def refusal_for(request: str, ledger_merchants: set[str] = frozenset()) -> str | None:
+    """The refusal for a delete or bill-level request, or None. Pure function, independent of the LLM.
+
+    A merchant-name change gets its own message: one that says "merchant"/"shop name", or that
+    renames a shop the ledger knows by its full name ("edit the name of <shop> to ...",
+    "rename <shop> to ..."); `ledger_merchants` are the ledger's shop names in the request
+    (db.bill_names_in). "change the name of rice ..." is a line description, not a shop.
+    """
     if _DELETE_WORDS.search(request):
         return _DELETE_UNSUPPORTED
+    folded = _folded(request)
+    if _MERCHANT_WORDS.search(request) or any(
+        re.search(rf"\b(?:name of|rename)\s+(?:the\s+)?{re.escape(_folded(m))}(?!\w)", folded)
+        for m in ledger_merchants
+    ):
+        return _MERCHANT_NAME_UNSUPPORTED
     if _BILL_LEVEL_WORDS.search(request):
         return _BILL_LEVEL_UNSUPPORTED
     return None
+
+
+def _merchants_in(request: str, connect: Callable[[], psycopg.Connection] | None) -> set[str]:
+    """The ledger's shop names in `request` -- looked up only when it talks about a name, since
+    only a "name of <shop>" / "rename <shop>" request needs them. Empty if the DB can't be read."""
+    if not _NAME_WORDS.search(request) or _MERCHANT_WORDS.search(request):
+        return set()
+    try:
+        with (connect or db.get_connection)() as conn:
+            return db.bill_names_in(conn, request)[0]
+    except (psycopg.Error, RuntimeError):
+        return set()
 
 
 # --- Phase 1: propose -----------------------------------------------------------
@@ -397,7 +428,7 @@ def propose_edits(
         return QueryResult(**base, message=error)
     if plan.status == "not_edit":
         return None
-    refusal = refusal_for(stripped)
+    refusal = refusal_for(stripped, _merchants_in(stripped, connect))
     if refusal:
         return QueryResult(**base, message=refusal)
     if plan.status == "unsupported":

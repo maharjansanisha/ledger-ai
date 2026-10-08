@@ -799,7 +799,8 @@ def test_delete_requests_reach_the_planner_so_they_get_a_clear_refusal():
     ("update the total paisa of ambikeshar pharma to Rs 4000",
      {"merchant": "ambikeshar pharma", "item": "total", "field": "amount", "new_value": "Rs 4000"}, "Bill-level"),
     ("change the merchant name of ambikehsar ayurvedic pharma to ambik pharma",
-     {"item": "ambikehsar ayurvedic pharma", "field": "description", "new_value": "ambik pharma"}, "Bill-level"),
+     {"item": "ambikehsar ayurvedic pharma", "field": "description", "new_value": "ambik pharma"},
+     "I can’t change the merchant/shop name"),
 ])
 @pytest.mark.parametrize("status", ["edit", "unsupported", "ambiguous"])
 def test_misclassified_delete_or_bill_level_edit_is_refused_before_the_database(
@@ -1025,3 +1026,56 @@ def test_a_previously_cached_rejected_plan_is_dropped_and_refetched():
                          response_schema=edit.EditPlan, client=FakeClient(OVERREACHING_PLAN))
     refetched, error = edit._get_plan(question, client=FakeClient(GOOD_PLAN))
     assert error is None and refetched.edits[0].item == "rice"
+
+
+
+# --- Merchant-name changes: a specific refusal, and never a line description edit ----------
+
+MERCHANT_RENAME = "edit the name of ambikeshar ayurvedic pharma to only ambik pharma"
+
+
+@pytest.mark.parametrize("request_text, merchants", [
+    ("change the merchant name of X to Y", set()),
+    ("Change the shop name to Ambik Pharma", set()),
+    (MERCHANT_RENAME, {"Ambikeshar Ayurvedic Pharma"}),
+    ("Rename Ambikeshar Ayurvedic Pharma to Ambik Pharma", {"Ambikeshar Ayurvedic Pharma"}),
+])
+def test_merchant_name_changes_get_the_merchant_refusal(request_text, merchants):
+    message = edit.refusal_for(request_text, merchants)
+    assert "merchant/shop name" in message and "Edit on the Dashboard" in message
+    assert "one at a time" not in message and "Bulk" not in message
+
+
+@pytest.mark.parametrize("request_text, merchants", [
+    ("Change the name of rice on the Shree Traders bill to Basmati", {"Shree Traders"}),  # an item's name
+    ("Rename line 3 on receipt #1 to Ambikeshar Pharma", {"Ambikeshar Pharma"}),          # new description
+    ("Change rice quantity to 5 for Ambikeshar Pharma", {"Ambikeshar Pharma"}),
+])
+def test_line_item_name_changes_are_not_merchant_refusals(request_text, merchants):
+    assert edit.refusal_for(request_text, merchants) is None
+
+
+@requires_test_db
+@pytest.mark.parametrize("status, llm_edits", [
+    ("unsupported", []),                                                   # how Gemini classifies it
+    ("edit", [{"item": "ambikeshar ayurvedic pharma", "field": "description", "new_value": "ambik pharma"}]),
+    ("edit", [{"merchant": "ambikeshar ayurvedic pharma", "item": "ambikeshar ayurvedic pharma",
+               "field": "description", "new_value": "only ambik pharma"}]),
+    ("ambiguous", []),
+])
+def test_merchant_rename_is_refused_and_never_becomes_a_description_edit(pharmacies, conn, status, llm_edits):
+    # Even a line whose description contains the shop's name can't be picked up.
+    save(conn, "Ambikeshar Ayurvedic Pharma", "AAP-2", [_line("Ambikeshar Ayurvedic Pharma tonic", 1, 30000)])
+    before = tables(conn)
+    result = propose(MERCHANT_RENAME, llm_edits, status=status)
+    assert result.edits == []
+    assert result.message.startswith("I can’t change the merchant/shop name from chat.")
+    assert "Edit on the Dashboard" in result.message
+    assert tables(conn) == before and proposal_statuses(conn) == []
+    assert conn.execute("SELECT count(*) FROM line_items WHERE description ILIKE '%ambik pharma%'").fetchone() == (0,)
+
+
+def test_merchant_rename_refusal_does_not_need_the_database_when_it_says_merchant():
+    result = propose_without_db("change the merchant name of ambikehsar ayurvedic pharma to ambik pharma",
+                                plan("unsupported"))
+    assert result.edits == [] and "merchant/shop name" in result.message
