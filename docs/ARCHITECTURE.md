@@ -105,7 +105,7 @@ flowchart TD
         LLMC["LLM client<br/>prompt + call + cache"]
         PAR["Pydantic parse<br/>ReceiptExtraction"]
         NOR["Normalizer<br/>amounts to paisa, BS/AD dates"]
-        VAL["Validator<br/>rules V1–V10 to flags"]
+        VAL["Validator<br/>rules V1–V11 to flags"]
         PLAN["Query planner<br/>question to QueryPlan"]
         GUARD["SQL safety guard"]
         EXEC["Read-only executor"]
@@ -220,7 +220,7 @@ Each component maps to one file or page (see §17).
 - **Reuse:** The review form sends human edits through **the same normalizer**, so AI values and human values are parsed identically.
 
 ### 3.7 Validation engine (`validate.py`)
-- **Responsibility:** Run rules V1–V10 (§10) and return flags plus a status.
+- **Responsibility:** Run rules V1–V11 (§10) and return flags plus a status.
 - **Inputs:** `ReceiptDraft`, `today`, config tolerances, and optionally existing records (for V10).
 - **Outputs:** `list[ValidationFlag]`, `status ∈ {clean, needs_review, invalid}`, `can_save`, `needs_override`.
 - **Allowed:** Read-only checks.
@@ -635,12 +635,13 @@ Tolerance `TOL = 100` paisa (±NPR 1), from config.
 | **V2** Positive amounts | all `*_paisa` | total > 0; none negative | BLOCKING | **Yes** |
 | **V3** Line arithmetic | each line item | `|round(qty × unit_price) − amount| ≤ TOL` (only if all three present) | WARNING | No |
 | **V4** Lines vs subtotal | line items, subtotal | `|Σ amount − subtotal| ≤ TOL` (only if both present) | WARNING | No |
-| **V5** Bill arithmetic | subtotal, discount, service_charge, vat, total | `|subtotal − discount + service_charge + vat − total| ≤ TOL` (missing discount/SC/VAT count as 0; skipped if subtotal is null) | ERROR | Overridable via *Save anyway* |
+| **V5** Bill arithmetic | subtotal, discount, service_charge, vat, total | `|subtotal − discount + service_charge + vat − total| ≤ TOL` (missing discount/SC/VAT count as 0; skipped if subtotal is null; V11 covers that case) | ERROR | Overridable via *Save anyway* |
 | **V6** VAT rate | vat, taxable = subtotal − discount + service_charge | `|vat − round(taxable × 13/100)| ≤ max(200, 1% of expected)` (skipped if vat is null) | WARNING | No |
 | **V7** PAN format | merchant_pan | exactly 9 digits (if present) | WARNING | No |
 | **V8** Date plausibility | date_ad, today | not after today; not before 2075-01-01 BS | WARNING (unparseable dates are already N2 + V1) | No |
 | **V9** Category | category | in the enum | BLOCKING | **Yes** |
 | **V10** Duplicate (SHOULD) | PAN+invoice_no, or merchant+date+total vs existing records | match found | WARNING | No |
+| **V11** Lines vs total (no subtotal) | line items, discount, service_charge, vat, total | base = Σ amount − discount + service_charge; passes if `|base + vat − total| ≤ TOL` (VAT on top) **or** `|base − total| ≤ TOL` (VAT already in line prices). Only if subtotal is null, total is present, and every line amount is present, so it never fires alongside V4/V5. Flag on `total_paisa`. Added 2026-10-08. | WARNING | No |
 | N1 | amount text | unparseable | WARNING (the field becomes null; V1 catches it if required) | No |
 | N2 | date text | unparseable / calendar unclear | WARNING (V1 then blocks) | via V1 |
 | N3 | date text | day/month order assumed | WARNING | No |
@@ -904,7 +905,7 @@ bahikhata-ai/
 │   ├── llm_client.py              # ONLY place that calls the LLM; prompt loading; cache; retry
 │   ├── extraction.py              # extract_draft() orchestration; diff_fields()
 │   ├── normalize.py               # amounts → paisa; dates → AD/BS; money formatter
-│   ├── validate.py                # V1–V10 (+ N-flags), status, can_save
+│   ├── validate.py                # V1–V11 (+ N-flags), status, can_save
 │   ├── db.py                      # schema DDL, save (transaction), dashboard reads, read-only executor
 │   ├── sql_guard.py               # sqlglot-based guard
 │   └── ask.py                     # answer_question(): planner, retry, formatting, explanation check
@@ -1052,7 +1053,7 @@ If asked "how confident are you?", the model will happily say 0.95 for a misread
 | R6 | **Text-to-SQL valid-but-wrong** (date ranges, unit confusion) | Wrong answers that look right | Precomputed date ranges, `_paisa` alias rule, SQL + range always shown, query eval, function-based fallback. |
 | R7 | **Provider structured-output quirks** (nullable unions) | Parse failures | Lenient all-string schema; Pydantic validation on our side; one retry. |
 | R8 | **BS library accuracy / edge years** | Wrong dates stored | Day-1 check against known pairs; unit tests. |
-| R9 | **Receipt diversity** (VAT-inclusive, service charge, discounts) | False V5/V6 flags | Explicit discount/service_charge fields; V5 treats missing as 0; V6 skipped when VAT is absent. Measure flag precision. |
+| R9 | **Receipt diversity** (VAT-inclusive, service charge, discounts) | False V5/V6/V11 flags | Explicit discount/service_charge fields; V5 treats missing as 0; V6 skipped when VAT is absent; V11 accepts both VAT-inclusive and VAT-exclusive line prices. Measure flag precision. |
 | R10 | **Privacy** (unmasked receipts pushed to GitHub or sent to API) | Real personal data exposure | Mask before photographing; gitignore `data/`; README disclosure. |
 | R11 | **Scope creep inside the architecture** (adding V10, S2, fancy UI early) | Missed MUSTs | Implementation order (§22): no SHOULD work until the MUST loop and both evals run end-to-end. |
 

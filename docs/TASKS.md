@@ -581,7 +581,7 @@ Legend for **Claude Code**: 🟢 GOOD FOR CLAUDE CODE · 🔵 COLLABORATIVE · �
 
 **What I need to understand:** Tolerance in paisa (±100); BLOCKING vs ERROR (overridable) vs WARNING; why the validator has no code path that returns a modified draft.
 
-**Implementation outcome:** `validate_draft(draft, today) -> (flags, status, can_save, needs_override)` implementing V1–V9 (V10 is a stub/hook, P1).
+**Implementation outcome:** `validate_draft(draft, today) -> (flags, status, can_save, needs_override)` implementing V1–V9 (V10 is a stub/hook, P1). V11 (lines vs total when no subtotal, WARNING) added 2026-10-08; see Decision Log.
 
 **Acceptance criteria (≥ 1 pass + 1 fail test per rule):**
 - V1 missing merchant/date/total → BLOCKING · V2 negative/zero → BLOCKING · V9 bad category → BLOCKING
@@ -589,6 +589,7 @@ Legend for **Claude Code**: 🟢 GOOD FOR CLAUDE CODE · 🔵 COLLABORATIVE · �
 - VAT-inclusive receipt (vat null) passes V5; V6 skipped
 - Restaurant: subtotal + 10% SC + VAT on (subtotal + SC) passes V5 and V6
 - V3, V4, V6, V7, V8 → WARNING only
+- V11 (added 2026-10-08): no subtotal, line items vs total beyond ±100 paisa → WARNING on total; passes VAT-inclusive and VAT-exclusive line prices; never alongside V4/V5
 - Status: clean / needs_review / invalid correct in each case
 - **Immutability test:** the draft is identical before and after validation
 
@@ -1224,7 +1225,7 @@ Order of value:
 
 The project is **complete** when all of these are true:
 
-1. **Capture:** upload a JPG/PNG → Gemini extraction → Pydantic → normalizer (paisa, AD+BS) → validator (V1–V9) → review screen with editable fields, line items and flags.
+1. **Capture:** upload a JPG/PNG → Gemini extraction → Pydantic → normalizer (paisa, AD+BS) → validator (V1–V9, V11) → review screen with editable fields, line items and flags.
 2. **HITL:** blocking flags prevent saving; V5 needs *Save anyway*; validation re-runs at save time; nothing saves without a click.
 3. **Store:** confirmed record + line items + audit (AI JSON, flags, edited fields, model, prompt version) in SQLite.
 4. **Dashboard:** total, by category, by month, receipts table, all from fixed SQL.
@@ -1271,7 +1272,7 @@ The project is **complete** when all of these are true:
 | Unit | Money parsing, Devanagari digits, Indian grouping | `test_normalize.py` | Fri (TASK-007) |
 | Unit | Date normalization, BS/AD detection, N2/N3 | `test_normalize.py` | Fri (TASK-008) |
 | Unit | Schema behaviour (lenient vs strict) | `test_schemas.py` / `test_db.py` | Fri (TASK-006) |
-| Unit | V1–V9 incl. VAT-inclusive & service charge; immutability; category (V9) | `test_validate.py` | Sat (TASK-010) |
+| Unit | V1–V9 and V11 incl. VAT-inclusive & service charge; immutability; category (V9) | `test_validate.py` | Sat (TASK-010) |
 | Unit | Duplicate detection (V10) | `test_validate.py` | P1 (TASK-051) |
 | Unit | Image intake | `test_images.py` | Sat (TASK-012) |
 | Unit | SQL guard adversarial set | `test_sql_guard.py` | Sun (TASK-022) |
@@ -1363,6 +1364,7 @@ No authentication, encryption or deployment security (out of scope).
 | 2026-10-03 | Amendment A1: Neon Postgres replaces SQLite | San's choice | +TASK-005 (~45 m Sat); demo needs internet for DB; ledger data stored in the cloud |
 | 2026-10-03 | ~~Schema managed by plain SQL migrations (`migrations/001_create_ledger_tables.sql`, `002_grant_ledger_reader.sql`) applied by `migrations/migrate.py` (records versions in `schema_migrations`). No Alembic/ORM.~~ Superseded same day by Amendment A2 (below). | Repeatable setup for `neondb`, `ledger_eval`, `ledger_test` | TASK-009 uses these tables instead of creating DDL in `db.py` |
 | 2026-10-03 | Amendment A2: schema now managed by **Alembic** (`migrations/versions/0001_create_ledger_tables.py`, `0002_grant_ledger_reader.py`), run via `make migrate` / `make migrate-reset`. Adds `alembic` + `sqlalchemy` as dependencies, used only as the migration engine. | San's choice; reverses the "no Alembic/ORM" line above | TASK-009 still uses these tables instead of creating DDL in `db.py`; app code (`db.py`, `ask.py`) still uses raw psycopg, no ORM |
+| 2026-10-08 | **V11 added: lines vs total when no subtotal is printed** (WARNING on `total_paisa`). base = Σ line amounts − discount + service_charge; passes if base + VAT ≈ total or base ≈ total (±NPR 1). `ValidationFlag.rule_id` now accepts V11. | Validation gap found in testing: with Subtotal blank, V4/V5 are skipped, so editing Total (e.g. 6,250 → 6,259) passed silently | V1–V9 unchanged; no save-anyway/override change (status becomes needs_review only); no DB migration (flags are JSONB); PRD §15 and ARCHITECTURE §10 updated |
 | | | | |
 
 ### Test-set run counter

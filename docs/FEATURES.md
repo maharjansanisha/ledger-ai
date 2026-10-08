@@ -27,7 +27,7 @@ The app ships 3 pages and 3 LLM uses (receipt extraction, question to SQL, resul
 | AI extraction | Schema-failure retry with the parse error; "Try again" or "Enter by hand" fallback | `bahikhata/extraction.py` |
 | Normalisation | Amounts to integer paisa (Rs/NPR/रू, lakh grouping, Devanagari digits); quantities like "1.5 kg" | `bahikhata/normalize.py` |
 | Normalisation | Dates to AD + Bikram Sambat (year, month) with year-range calendar rule and ambiguity flags | `bahikhata/normalize.py` |
-| Validation | Rules V1–V9: required fields, non-negative amounts, line maths, subtotal and total reconciliation, ~13% VAT, 9-digit PAN, date sanity, allowed category; status clean / needs_review / invalid | `bahikhata/validate.py` |
+| Validation | Rules V1–V9 and V11: required fields, non-negative amounts, line maths, subtotal and total reconciliation (line items vs total when no subtotal is printed), ~13% VAT, 9-digit PAN, date sanity, allowed category; status clean / needs_review / invalid | `bahikhata/validate.py` |
 | Human review | Editable form and line-item table, inline flags, Re-validate, Confirm & Save blocked by blocking flags, explicit "save anyway" override | `pages/capture_and_review/views.py`, `bahikhata/review.py` |
 | Persistence and audit | One transaction across `receipts`, `line_items`, `receipt_audit` (raw model output, AI draft, flags, human-edited fields, model and prompt version, image hash) | `bahikhata/db.py`, migration 0001 |
 | Dashboard | Landing page: hero banner, KPI tiles, period and status filters, receipts table; fixed SQL, no LLM | `pages/dashboard/` |

@@ -319,6 +319,27 @@ def test_missing_total_message_is_shown_under_the_total_field(env):
     assert "total is missing" not in "\n".join(m.value for m in at.markdown).lower()  # not repeated at the top
 
 
+def test_edited_total_without_subtotal_warns_under_total_and_still_saves(env):
+    # No subtotal or VAT printed; the line items add up to the extracted total, Rs 6,250.
+    env(json.dumps({**GOOD, "subtotal_raw": None, "vat_amount_raw": None, "total_raw": "6,250", "line_items": [
+        {"description": "Rice", "quantity_raw": "2", "unit_price_raw": "2500", "amount_raw": "5,000"},
+        {"description": "Oil", "quantity_raw": "1", "unit_price_raw": "1115", "amount_raw": "1,115"},
+        {"description": "Salt", "quantity_raw": "1", "unit_price_raw": "135", "amount_raw": "135"},
+    ]}))
+    at = extract(start(png()))
+    assert element_after(at, "total_1").type != "caption"           # consistent as extracted: no message
+
+    at.text_input(key="total_1").set_value("6259")
+    submit(at, "Re-validate")
+    below_total = element_after(at, "total_1")
+    assert below_total.type == "caption"
+    assert below_total.value == ("⚠️ Line items 6,250.00 − discount 0.00 + service charge 0.00 = 6,250.00 "
+                                 "but total is 6,259.00 (diff 9.00)")
+    assert "V11" not in text(at) and "VAT 0.00" not in text(at)
+    assert not save_button(at).disabled                              # a warning never blocks saving
+    assert not at.checkbox                                           # and needs no "save anyway"
+
+
 def test_cant_save_line_appears_then_disappears_after_fixing(env):
     env(json.dumps({**GOOD, "total_raw": None, "date_raw": None}))
     at = extract(start(png()))

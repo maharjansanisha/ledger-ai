@@ -186,9 +186,11 @@ def test_category_and_status_match_db_checks():
 
 def test_validation_flag_rule_ids_and_severity():
     ValidationFlag(rule_id="V10", severity="WARNING", message="possible duplicate")
+    ValidationFlag(rule_id="V11", severity="WARNING", message="lines vs total (no subtotal)")
     ValidationFlag(rule_id="EXTRACTION_FAILED", severity="BLOCKING", message="x")
-    with pytest.raises(ValidationError):
-        ValidationFlag(rule_id="V11", severity="WARNING", message="x")
+    for rule_id in ("V12", "V0", "V110"):
+        with pytest.raises(ValidationError):
+            ValidationFlag(rule_id=rule_id, severity="WARNING", message="x")
     with pytest.raises(ValidationError):
         ValidationFlag(rule_id="V1", severity="FATAL", message="x")
 

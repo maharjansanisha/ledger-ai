@@ -282,9 +282,11 @@ All rules are deterministic Python. Default tolerance is ±NPR 1 to allow for ro
 | V8 | Date parses and converts; not in the future; not implausibly old (e.g. before 2075 BS / 2018 AD) | ERROR if unparseable, WARNING if implausible |
 | V9 | category is in the enum | ERROR |
 | V10 | Possible duplicate of an existing record (SHOULD, S1) | WARNING |
+| V11 | No subtotal printed: sum of line items − discount + service_charge (+ vat_amount, if present) ≈ total (added 2026-10-08) | WARNING |
 
 Notes:
 - VAT-inclusive receipts (no separate VAT line) must pass V5 when vat_amount is null. V6 is skipped.
+- V11 runs only when subtotal is missing (so V4/V5 cannot run). Line prices may or may not include VAT, so V11 passes if either reading adds up: with vat_amount added on top, or with VAT already in the line prices.
 - Validation **flags** problems and never auto-corrects values. Correction is the human's job.
 
 ## 16. Human-in-the-loop requirements

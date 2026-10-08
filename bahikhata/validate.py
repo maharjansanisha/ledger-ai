@@ -1,4 +1,4 @@
-"""Validation rules V1-V9 (ARCHITECTURE.md §10, PRD §15, TASK-010).
+"""Validation rules V1-V9 and V11 (ARCHITECTURE.md §10, PRD §15, TASK-010).
 
 The validator DETECTS and never corrects: it receives a draft and returns flags.
 There is no code path that returns a modified draft.
@@ -6,7 +6,7 @@ There is no code path that returns a modified draft.
 Severities (decision D2):
 - BLOCKING (V1 required fields, V2 positive amounts, V9 category): cannot save.
 - ERROR (V5 bill arithmetic): can be saved only with an explicit "Save anyway".
-- WARNING (V3, V4, V6, V7, V8): shown, never block.
+- WARNING (V3, V4, V6, V7, V8, V11): shown, never block.
 V10 (duplicates) is P1 (TASK-051); `existing` is the hook for it and is unused here.
 
 All money arithmetic is on integer paisa; tolerances come from config.
@@ -117,6 +117,32 @@ def _v5_bill_arithmetic(draft: ReceiptDraft) -> list[ValidationFlag]:
                   f"{_npr(draft.total_paisa)} (diff {_npr(diff)})")]
 
 
+def _v11_lines_vs_total(draft: ReceiptDraft) -> list[ValidationFlag]:
+    """Lines vs total when there is no subtotal, so V4/V5 are skipped and never fire alongside.
+
+    Line prices may or may not include VAT, so the bill passes if either reading adds up:
+    base + VAT ≈ total (VAT on top, as in V5) or base ≈ total (VAT already in the prices).
+    """
+    amounts = [item.amount_paisa for item in draft.line_items]
+    if draft.subtotal_paisa is not None or draft.total_paisa is None or not amounts or None in amounts:
+        return []
+    lines_total = sum(amounts)
+    discount = draft.discount_paisa or 0
+    service_charge = draft.service_charge_paisa or 0
+    base = lines_total - discount + service_charge
+    vat = draft.vat_paisa
+    expected = base + (vat or 0)
+    diff = draft.total_paisa - expected
+    if abs(diff) <= config.AMOUNT_TOLERANCE_PAISA or abs(draft.total_paisa - base) <= config.AMOUNT_TOLERANCE_PAISA:
+        return []
+    vat_text = f" + VAT {_npr(vat)}" if vat is not None else ""  # no "VAT 0.00" when no VAT was read
+    included = f"; with VAT included in the line prices: {_npr(base)}" if vat is not None else ""
+    return [_flag("V11", "WARNING", "total_paisa",
+                  f"line items {_npr(lines_total)} − discount {_npr(discount)} + service charge "
+                  f"{_npr(service_charge)}{vat_text} = {_npr(expected)} but total is "
+                  f"{_npr(draft.total_paisa)} (diff {_npr(diff)}){included}")]
+
+
 def _v6_vat_rate(draft: ReceiptDraft) -> list[ValidationFlag]:
     if draft.vat_paisa is None or draft.subtotal_paisa is None:
         return []  # VAT-inclusive bill, or nothing to compare against
@@ -185,7 +211,7 @@ def may_save(flags: Iterable[ValidationFlag], user_override: bool) -> bool:
 def validate_draft(
     draft: ReceiptDraft, today: date, existing=None
 ) -> tuple[list[ValidationFlag], ReceiptStatus, bool, bool]:
-    """Run V1-V9 on a draft. Returns (flags, status, can_save, needs_override).
+    """Run V1-V9 and V11 on a draft. Returns (flags, status, can_save, needs_override).
 
     `today` is passed in, never read from the clock (A§2 P10). The draft is not modified.
     """
@@ -199,5 +225,6 @@ def validate_draft(
         *_v7_pan(draft),
         *_v8_date_plausible(draft, today),
         *_v9_category(draft),
+        *_v11_lines_vs_total(draft),
     ]
     return (flags, *summarize_flags(flags))

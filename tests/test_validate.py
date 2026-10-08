@@ -1,4 +1,4 @@
-"""TASK-010: validator V1-V9, status, save rules, immutability."""
+"""TASK-010: validator V1-V9 and V11, status, save rules, immutability."""
 
 import copy
 from datetime import date, timedelta
@@ -178,6 +178,82 @@ def test_restaurant_with_service_charge_passes_v5_and_v6():
     # subtotal 1,000 + 10% SC 100 = 1,100 taxable; VAT 13% = 143; total 1,243
     d = draft(service_charge_paisa=10000, vat_paisa=14300, total_paisa=124300)
     assert ids(d) == []
+
+
+# --- V11 lines vs total, when there is no subtotal (WARNING) -------------------
+
+# Three lines adding up to Rs 6,250; no subtotal, no VAT printed.
+LINES_6250 = [
+    {"quantity": "2", "unit_price_paisa": 250000, "amount_paisa": 500000},
+    {"quantity": "1", "unit_price_paisa": 111500, "amount_paisa": 111500},
+    {"quantity": "1", "unit_price_paisa": 13500, "amount_paisa": 13500},
+]
+
+
+def no_subtotal(**overrides) -> ReceiptDraft:
+    return draft(**{"subtotal_paisa": None, "vat_paisa": None, "line_items": LINES_6250, **overrides})
+
+
+def test_v11_flags_an_edited_total_under_total_without_blocking_save():
+    flags, status, can_save, needs_override = run(no_subtotal(total_paisa=625900))
+    assert [(f.rule_id, f.severity, f.field) for f in flags] == [("V11", "WARNING", "total_paisa")]
+    assert flags[0].message == (
+        "V11: line items 6,250.00 − discount 0.00 + service charge 0.00 = 6,250.00 "
+        "but total is 6,259.00 (diff 9.00)"
+    )  # no "VAT 0.00" when no VAT was read
+    assert status == "needs_review" and can_save and not needs_override
+
+
+@pytest.mark.parametrize("total, flagged", [
+    (625000, False), (625000 + TOL, False), (625000 - TOL, False), (625000 + TOL + 1, True), (625000 - TOL - 1, True),
+])
+def test_v11_tolerance_boundary(total, flagged):
+    assert ("V11" in ids(no_subtotal(total_paisa=total))) is flagged
+
+
+def test_v11_message_shows_vat_when_present():
+    flags = run(no_subtotal(vat_paisa=81250, total_paisa=800000))[0]
+    message = next(f.message for f in flags if f.rule_id == "V11")
+    assert message == (
+        "V11: line items 6,250.00 − discount 0.00 + service charge 0.00 + VAT 812.50 = 7,062.50 "
+        "but total is 8,000.00 (diff 937.50); with VAT included in the line prices: 6,250.00"
+    )
+
+
+def test_v11_vat_exclusive_line_prices_pass():
+    # VAT bill without a printed subtotal: lines 1,000 + VAT 130 = 1,130
+    assert "V11" not in ids(draft(subtotal_paisa=None))
+
+
+def test_v11_vat_inclusive_line_prices_with_a_vat_note_pass():
+    # Line prices already include VAT; the receipt also prints "VAT 130 included"
+    d = draft(subtotal_paisa=None, total_paisa=113000,
+              line_items=[{"quantity": "2", "unit_price_paisa": 56500, "amount_paisa": 113000}])
+    assert "V11" not in ids(d)
+
+
+def test_v11_restaurant_and_discount_pass():
+    # lines 1,000 + SC 100 + VAT 143 = 1,243; lines 1,000 − discount 100 + VAT 117 = 1,017
+    assert "V11" not in ids(draft(subtotal_paisa=None, service_charge_paisa=10000, vat_paisa=14300, total_paisa=124300))
+    assert "V11" not in ids(draft(subtotal_paisa=None, discount_paisa=10000, vat_paisa=11700, total_paisa=101700))
+
+
+@pytest.mark.parametrize("overrides", [
+    {"subtotal_paisa": 625000},                                    # subtotal present: V4/V5 territory
+    {"line_items": []},                                            # nothing to add up
+    {"line_items": [*LINES_6250[:2], {"amount_paisa": None}]},     # a line amount is missing
+    {"total_paisa": None},                                         # V1 already reports it
+])
+def test_v11_skipped(overrides):
+    assert "V11" not in ids(no_subtotal(**{"total_paisa": 625900, **overrides}))
+
+
+def test_v11_never_fires_alongside_v4_or_v5():
+    with_subtotal = ids(draft(total_paisa=999999))                       # V5 only
+    without_subtotal = ids(draft(subtotal_paisa=None, total_paisa=999999))  # V11 only
+    assert "V5" in with_subtotal and "V11" not in with_subtotal
+    assert "V11" in without_subtotal and not {"V4", "V5"} & set(without_subtotal)
+    assert ids(draft()) == []                                            # the clean bill stays clean
 
 
 # --- V6 VAT rate (WARNING) ---------------------------------------------------

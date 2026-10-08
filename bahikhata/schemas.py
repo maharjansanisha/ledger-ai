@@ -12,7 +12,7 @@ Design rule: lenient at the input boundary, strict at the output boundary.
 Money is always integer paisa (1 NPR = 100 paisa) in fields ending in `_paisa`.
 Paisa fields are strict ints: floats such as 12.5 or 12.0 are rejected.
 
-Shape and single-field checks live here; rules across fields (V3-V6 arithmetic,
+Shape and single-field checks live here; rules across fields (V3-V6 and V11 arithmetic,
 V8 date plausibility, V10 duplicates) live in validate.py.
 """
 
@@ -81,7 +81,7 @@ class ReceiptExtraction(BaseModel):
 # --- Validation output -------------------------------------------------------
 
 class ValidationFlag(BaseModel):
-    rule_id: Annotated[str, StringConstraints(pattern=r"^(V([1-9]|10)|N[1-3]|EXTRACTION_FAILED)$")]
+    rule_id: Annotated[str, StringConstraints(pattern=r"^(V([1-9]|1[01])|N[1-3]|EXTRACTION_FAILED)$")]
     severity: Literal["BLOCKING", "ERROR", "WARNING"]
     field: str | None = None
     message: str                             # includes the numbers involved
