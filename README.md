@@ -58,7 +58,7 @@ Flow: capture → validate → confirm → store → query.
    make migrate TARGET=eval   # ledger_eval
    ```
 
-   Migration `0002` grants `ledger_reader` `SELECT` on `receipts` and `line_items` only. `receipt_audit` stays unreadable to that role, as does `line_item_edits` (migration `0003`: chat edit proposals and their outcome).
+   Migration `0002` grants `ledger_reader` `SELECT` on `receipts` and `line_items` only. `receipt_audit` stays unreadable to that role, as does `line_item_edits` (migrations `0003`/`0004`: chat edit proposals, their outcome, and database-enforced lifecycle rules).
 
 ## Run the app
 

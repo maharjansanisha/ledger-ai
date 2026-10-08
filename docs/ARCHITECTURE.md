@@ -72,21 +72,26 @@ Everything else in Amendment A1: psycopg v3 for app code, `.env` variable names,
 
 ## Amendment A3 — Chat edits to saved line items, with explicit approval (proposed 2026-10-08, pending approval)
 
-**Decision:** Ask Your Ledger can *propose* a change to one cell (description, quantity, unit price or amount) of a saved line item; the change is applied only when the user clicks **Approve change** on that proposal's card. Implemented in `bahikhata/edit.py`, migration `0003_line_item_edits`, prompt `edit_v1`.
+**Decision:** Ask Your Ledger can *propose* a change to one cell (description, quantity, unit price or amount) of a saved line item; the change is applied only when the user clicks **Approve change** on that proposal's card. Implemented in `bahikhata/edit.py`, migrations `0003_line_item_edits` and `0004_line_item_edits_lifecycle`, prompt `edit_v1`.
 
-**Invariants (enforced in code, not by the prompt):**
+**Key invariant:** the LLM produces a proposal only. A database mutation is possible only through explicit approval of a stored proposal, and the server executes only the immutable target and value stored in that proposal.
+
+**Invariants (enforced in code and the database, not by the prompt):**
 
 | Invariant | How |
 |---|---|
 | The LLM cannot mutate anything | Its only output is an `EditPlan` (JSON). `propose_edits` reads, checks and inserts a `pending` row into `line_item_edits`; it never writes `receipts`, `line_items` or `receipt_audit`. The text-to-SQL path is unchanged (read-only role + guard; `line_item_edits` is not in the guard's allowlist and has no `ledger_reader` grant). |
-| No scope expansion | Every target and value in the plan must literally appear in the user's request (`edit.outside_request`); each edit must resolve to exactly **one** line item, otherwise the user is asked to clarify; bulk, add/delete and bill-level edits are refused. If any edit in a request fails, none is proposed. |
-| Approval is bound to one proposal | Approve sends only the proposal id; the target and values are read back from `line_item_edits`, row-locked, and checked for session, `pending` status and expiry (`EDIT_PROPOSAL_TTL_MINUTES`). |
-| Exact, single-cell write | `db.update_line_item_field`: `UPDATE line_items SET <one allowlisted column> WHERE id AND receipt_id AND line_no` **and** every column equals the snapshot taken when proposed (compare-and-swap). A changed or re-saved line makes the proposal `stale`; nothing is overwritten. |
-| At most once | The row lock plus the `pending → applied` transition happen in the same transaction as the write; a second click (or a concurrent one) sees `applied`. |
+| Canonical target, resolved by the server | The bill comes from `edit.ground_receipt`, never from the model: a receipt number counts only if the user wrote it *as* a receipt number (`receipt #12`, `bill 12`, `#12`) or it comes from trusted server-side context (`active_receipt_id`; the Ask page has none and passes `None`). The model's `receipt_id` is only a cross-check: one that is not that receipt, a message naming more than one receipt, or a named receipt the model did not target all end in a clarification. Line numbers likewise count only when written as `line N` / `row N`. The resolved line is stored as canonical ids (`receipt_id`, `line_item_id`, `line_no`) with the field and old/new values. |
+| No scope expansion | Every target and value in the plan must appear in the user's request (`edit.outside_request`); each edit must resolve to exactly **one** line item, otherwise the user is asked to clarify; bulk, add/delete and bill-level edits are refused. If any edit in a request fails, none is proposed. |
+| Approval is bound to one proposal | Approve and Cancel send only the proposal id; the target and values are read back from `line_item_edits`, row-locked (`FOR UPDATE`), and checked for session, `pending` status and expiry. The 0004 trigger makes a proposal's target and values immutable after insert (only `status` and `decided_at` may change). |
+| Exact, single-cell write | `db.update_line_item_field`: `UPDATE line_items SET <one allowlisted column> WHERE id AND receipt_id AND line_no` **and** every column (including the target's old value) equals the snapshot taken when proposed (compare-and-swap). 0 rows: the proposal becomes `stale`, nothing else is written and the user sees the line's current values. More than 1 row raises, the transaction rolls back and the change is reported as not done. |
+| At most once | Lock, checks, the one-cell write, re-derivation and `pending → applied` are a single transaction; a second or concurrent click sees `applied`. |
+| Lifecycle | `pending → applied \| cancelled \| stale \| expired`. Only `pending` may execute. End states are final in the database (0004 trigger), and `decided_at` is set exactly when a proposal leaves `pending` (CHECK). |
+| 15-minute expiry | `expires_at = created_at + EDIT_PROPOSAL_TTL_MINUTES` (15). Approval checks it itself, so a `pending` row past `expires_at` can never execute even if cleanup never ran. Cleanup is request-time (there is no job system): every edit request first marks overdue `pending` rows `expired` with `decided_at = expires_at` (idempotent, rows kept); apply/cancel do the same for the proposal they touch. |
 | Derived values | The validator still detects and never corrects: changing a quantity does not recompute the amount. `receipts.status` and `receipt_audit.flags_at_save_json` / `edited_fields_json` are re-derived in the same transaction, as the Dashboard's Edit does. |
-| Audit | `line_item_edits` keeps the request text, session, row snapshot, old and new value, status and timestamps, `source = 'chat_agent'`. |
+| Audit / change record | `line_item_edits` rows are never deleted by this feature: request text, session, canonical target, row snapshot, old and new value, status, `created_at`, `expires_at`, `decided_at`, `source = 'chat_agent'`. (Deleting a receipt still cascades to its proposals, as it does to `receipt_audit`.) |
 
-**Limitation:** the MVP has no user accounts, so "authorization" is the chat session that created the proposal (server-side Streamlit session state), not a user identity.
+**Limitations:** the MVP has no user accounts, so "authorization" is the chat session that created the proposal (server-side Streamlit session state), not a user identity. Merchant names and invoice numbers are grounded by literal presence in the request plus unique resolution, not by the receipt-number rule above.
 
 ---
 
