@@ -16,6 +16,7 @@ Connections are opened per operation (Neon is serverless; no global connection):
 """
 
 import calendar
+import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -268,6 +269,35 @@ def find_line_items(
             params,
         )
         return cur.fetchall()
+
+
+def _named_in(name: str, text: str) -> bool:
+    """`name` appears in `text` as whole words (case- and spacing-insensitive): "INV-1" is not in "INV-12"."""
+    name, text = " ".join(name.casefold().split()), " ".join(text.casefold().split())
+    return bool(name) and re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text) is not None
+
+
+def bill_names_in(conn: psycopg.Connection, text: str) -> tuple[set[str], set[str]]:
+    """(merchant names, invoice numbers) from the ledger that `text` mentions as whole words.
+    A name inside a longer mentioned name ("Hari" in "Hari Stores") is dropped. Read only."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT DISTINCT merchant_name FROM receipts WHERE strpos(lower(%(t)s), lower(btrim(merchant_name))) > 0",
+            {"t": text},
+        )
+        merchants = {row[0].strip() for row in cur.fetchall()}
+        cur.execute(
+            "SELECT DISTINCT invoice_number FROM receipts WHERE btrim(coalesce(invoice_number, '')) <> ''"
+            " AND strpos(lower(%(t)s), lower(btrim(invoice_number))) > 0",
+            {"t": text},
+        )
+        invoices = {row[0].strip() for row in cur.fetchall()}
+
+    def longest(names: set[str]) -> set[str]:
+        found = {n for n in names if _named_in(n, text)}
+        return {n for n in found if not any(n != m and _named_in(n, m) for m in found)}
+
+    return longest(merchants), longest(invoices)
 
 
 _INSERT_EDIT_PROPOSAL = """

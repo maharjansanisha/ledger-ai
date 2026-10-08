@@ -10,7 +10,11 @@ Two phases, enforced by code -- the prompt is not the safety boundary:
    row in line_item_edits. The bill is grounded by the server, not the LLM: a receipt
    number counts only if the user wrote it as one ("receipt #12") or it comes from
    trusted server-side context (ground_receipt); the model's own receipt_id is just a
-   cross-check, so it cannot redirect an edit to another bill. Nothing here writes to
+   cross-check, so it cannot redirect an edit to another bill. Shop names and invoice
+   numbers are grounded the same way against the ledger (ground_bill_names): if the
+   message names more than one, or the model didn't use the one named, nothing is
+   proposed. Requests to delete, or that touch a bill-level field (merchant, totals,
+   VAT, date, ...), are refused by code whatever the plan says. Nothing here writes to
    receipts, line_items or receipt_audit. Unclear, ambiguous and bulk requests get a
    question, not a guess; if any edit in a request can't be resolved, none is proposed.
 
@@ -48,7 +52,7 @@ from decimal import Decimal
 from typing import Any, Callable
 
 import psycopg
-from pydantic import ValidationError
+from pydantic import ConfigDict, Field, ValidationError
 
 from bahikhata import config, db, llm_client
 from bahikhata.extraction import diff_fields
@@ -83,11 +87,33 @@ _UNSURE_RECEIPT = ("I wasn't sure receipt #{} is the bill you want to change, so
                    f"Please say it plainly, {_EXAMPLE}.")
 _CONTEXT_CONFLICT = ("You're working on receipt #{}, but your message names receipt #{}. Nothing was proposed — "
                      "please make the change from that receipt, or name only the one you're working on.")
+_SEVERAL_NAMES = ("Your message mentions more than one {} ({}), so I can't tell which bill to change and "
+                  "nothing was proposed. Please name only the bill you want to change.")
+_UNSURE_NAME = ("I wasn't sure “{}” is the bill you want to change, so nothing was proposed. "
+                f"Please say it plainly, {_EXAMPLE}.")
+_DELETE_UNSUPPORTED = ("Deleting receipts or line items isn't supported from the chat, so nothing was proposed "
+                       "or changed. I can only change the description, quantity, unit price or amount of a line "
+                       "you name.")
+_BILL_LEVEL_UNSUPPORTED = ("Bill-level fields (merchant, date, totals, VAT, discount, category) can't be changed "
+                           "from the chat, so nothing was proposed or changed — use Edit on the Dashboard for those. "
+                           "I can only change the description, quantity, unit price or amount of a line you name.")
 _DB_UNREACHABLE = "I couldn't reach your ledger database right now — nothing was changed. Please try again."
 
 # --- Request gate ---------------------------------------------------------------
 
-_EDIT_WORDS = re.compile(r"\b(change|update|set|edit|correct|fix|modify|replace|rename)\b", re.IGNORECASE)
+_EDIT_WORDS = re.compile(
+    r"\b(change|update|set|edit|correct|fix|modify|replace|rename|delete|remove|erase)\b", re.IGNORECASE,
+)
+# Refused by code, not by the prompt: a request that would delete something, or that mentions a
+# bill-level field, never becomes a line-item proposal (e.g. "change the merchant name to X"
+# can't turn into a description edit). Errs on refusing: an item literally named "total" can't
+# be renamed from the chat.
+_DELETE_WORDS = re.compile(r"\b(delete|remove|erase)\b", re.IGNORECASE)
+_BILL_LEVEL_WORDS = re.compile(
+    r"\b(merchant|shop name|store name|seller|vendor|sub-?total|total|vat|tax|discount|service charge|date"
+    r"|category|pan (?:no|number))\b",
+    re.IGNORECASE,
+)
 
 
 def looks_like_edit(question: str) -> bool:
@@ -96,7 +122,28 @@ def looks_like_edit(question: str) -> bool:
     return bool(_EDIT_WORDS.search(question))
 
 
+def refusal_for(request: str) -> str | None:
+    """The refusal for a delete or bill-level request, or None. Pure function, independent of the LLM."""
+    if _DELETE_WORDS.search(request):
+        return _DELETE_UNSUPPORTED
+    if _BILL_LEVEL_WORDS.search(request):
+        return _BILL_LEVEL_UNSUPPORTED
+    return None
+
+
 # --- Phase 1: propose -----------------------------------------------------------
+
+class _StrictEditRequest(LineItemEditRequest):
+    model_config = ConfigDict(extra="forbid")
+
+
+class _StrictEditPlan(EditPlan):
+    """Parses the model's reply: any key outside the schema (an "operation", a "line_item_id",
+    ...) makes the whole plan unreadable rather than being silently dropped."""
+
+    model_config = ConfigDict(extra="forbid")
+    edits: list[_StrictEditRequest] = Field(default_factory=list)
+
 
 def _get_plan(question: str, *, client=None) -> tuple[EditPlan | None, str | None]:
     """One LLM call -> (plan, None), or (None, user-safe message). Cached by the question."""
@@ -109,7 +156,7 @@ def _get_plan(question: str, *, client=None) -> tuple[EditPlan | None, str | Non
     except llm_client.LLMError as exc:
         return None, exc.user_message
     try:
-        return EditPlan.model_validate_json(response.text), None
+        return _StrictEditPlan.model_validate_json(response.text), None
     except ValidationError:
         return None, _COULD_NOT_READ
 
@@ -209,6 +256,28 @@ def ground_receipt(
     if named and any(e.receipt_id is None for e in edits):
         return None, _UNSURE_RECEIPT.format(grounded)  # the user named one, the model didn't take it as the target
     return grounded, None
+
+
+def ground_bill_names(
+    edits: list[LineItemEditRequest], merchants: set[str], invoices: set[str],
+) -> tuple[list[LineItemEditRequest] | None, str | None]:
+    """Ground shop names and invoice numbers like receipt numbers -> (edits, None) or (None, question).
+
+    `merchants` / `invoices` are the ledger's own names that appear in the message
+    (db.bill_names_in). More than one named -> ask. Exactly one -> every edit must use it (the
+    model's text must be part of it) and the filter becomes the ledger's exact name. None named
+    -> unchanged: the model's text must still be in the message and resolve to one line.
+    Used only when no receipt is fixed by number or trusted context. Pure function.
+    """
+    for attr, names, kind in (("merchant", merchants, "shop"), ("invoice_number", invoices, "invoice")):
+        if len(names) > 1:
+            return None, _SEVERAL_NAMES.format(kind, ", ".join(f"“{n}”" for n in sorted(names)))
+        if names:
+            canonical = next(iter(names))
+            if any(getattr(e, attr) is None or _folded(getattr(e, attr)) not in _folded(canonical) for e in edits):
+                return None, _UNSURE_NAME.format(canonical)
+            edits = [e.model_copy(update={attr: canonical}) for e in edits]
+    return edits, None
 
 
 def parse_value(field: EditField, text: str) -> Any:
@@ -327,6 +396,9 @@ def propose_edits(
         return QueryResult(**base, message=error)
     if plan.status == "not_edit":
         return None
+    refusal = refusal_for(stripped)
+    if refusal:
+        return QueryResult(**base, message=refusal)
     if plan.status == "unsupported":
         return QueryResult(**base, message=_UNSUPPORTED)
     if plan.status == "ambiguous" or not plan.edits:
@@ -353,6 +425,10 @@ def propose_edits(
     try:
         with (connect or db.get_connection)() as conn:
             db.expire_edit_proposals(conn, now)  # request-time cleanup; committed even if nothing is proposed
+            if receipt_id is None:
+                edits, problem = ground_bill_names(edits, *db.bill_names_in(conn, stripped))
+                if problem:
+                    return QueryResult(**base, message=problem)
             resolved = []
             for edit, value in zip(edits, new_values):
                 row, problem = _resolve(conn, edit)

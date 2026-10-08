@@ -6,8 +6,10 @@ The second half runs the real SQL against TEST_DATABASE_URL (same safety rules a
 tests/test_db.py: skipped if unset, refused unless the database name ends in "_test").
 """
 
+import inspect
 import json
 import os
+import uuid
 import threading
 from types import SimpleNamespace
 from datetime import date, datetime, timedelta, timezone
@@ -757,3 +759,235 @@ def test_a_failed_invariant_rolls_back_and_is_not_reported_as_applied(ledger, co
     outcome = approve(result)
     assert outcome.status == "failed" and not outcome.applied
     assert tables(conn) == before and proposal_statuses(conn) == ["pending"]
+
+
+# --- Deterministic refusals: delete and bill-level requests never become proposals -------
+
+@pytest.mark.parametrize("request_text", [
+    "delete entry for ambikeshar pharma",
+    "Remove the rice line from receipt #1",
+    "update the total paisa of ambikeshar pharma to Rs 4000",
+    "change the merchant name of ambikehsar ayurvedic pharma to ambik pharma",
+    "Set the VAT on receipt #1 to 130",
+    "Change the date of receipt #1 to 2026-09-01",
+    "Change the category of receipt #1 to Food",
+])
+def test_refusal_for_delete_and_bill_level_requests(request_text):
+    assert edit.refusal_for(request_text) is not None
+
+
+@pytest.mark.parametrize("request_text", [
+    "Change the description of Rice to Basmati Rice",
+    "Change Rice quantity to 5",
+    "Change Rice unit price to Rs 120",
+    "Change Rice amount to Rs 600",
+    "Rename line 1 on receipt #1 to Ambik Pharma",   # a description edit, not a merchant edit
+    "Change rice quantity to 5 for Ambikeshar Pharma",
+])
+def test_line_item_requests_are_not_refused(request_text):
+    assert edit.refusal_for(request_text) is None
+
+
+def test_delete_requests_reach_the_planner_so_they_get_a_clear_refusal():
+    assert edit.looks_like_edit("delete entry for ambikeshar pharma")
+
+
+@pytest.mark.parametrize("request_text, llm_edit, expected", [
+    # The model wrongly turns a delete / a total / a merchant rename into a line-item edit: refused anyway.
+    ("delete entry for ambikeshar pharma",
+     {"merchant": "ambikeshar pharma", "item": "entry", "field": "description", "new_value": "entry"}, "Deleting"),
+    ("update the total paisa of ambikeshar pharma to Rs 4000",
+     {"merchant": "ambikeshar pharma", "item": "total", "field": "amount", "new_value": "Rs 4000"}, "Bill-level"),
+    ("change the merchant name of ambikehsar ayurvedic pharma to ambik pharma",
+     {"item": "ambikehsar ayurvedic pharma", "field": "description", "new_value": "ambik pharma"}, "Bill-level"),
+])
+@pytest.mark.parametrize("status", ["edit", "unsupported", "ambiguous"])
+def test_misclassified_delete_or_bill_level_edit_is_refused_before_the_database(
+    request_text, llm_edit, expected, status,
+):
+    edits = [llm_edit] if status == "edit" else []
+    result = propose_without_db(request_text, plan(status, edits))
+    assert result.edits == [] and result.message.startswith(expected)
+
+
+def test_a_question_that_mentions_removing_is_still_answered_as_a_question():
+    assert propose_without_db("How much did I spend after removing VAT?", plan("not_edit")) is None
+
+
+# --- Malformed or overreaching model output: no proposal, and the DB is never reached -----
+
+@pytest.mark.parametrize("llm_reply", [
+    "{not json",
+    '{"status": "edit", "edits": [{"item": "rice", "field": "total", "new_value": "5"}]}',          # invalid field
+    '{"status": "edit", "edits": [{"item": "rice", "field": ["quantity", "amount"], "new_value": "5"}]}',
+    '{"status": "delete", "edits": []}',                                                           # unknown status
+    '{"status": "edit", "edits": [{"receipt_id": "abc", "item": "rice", "field": "quantity", "new_value": "5"}]}',
+    '{"status": "edit", "edits": [{"item": "rice", "field": "quantity"}]}',                       # no new value
+    '{"status": "edit", "edits": {"item": "rice", "field": "quantity", "new_value": "5"}}',        # not a list
+    '{"status": "edit", "operation": "delete", "edits": []}',                                     # unknown operation
+    '{"status": "edit", "edits": [{"item": "rice", "field": "quantity", "new_value": "5", "line_item_id": 7}]}',
+    '{"status": "edit", "edits": [{"item": "rice", "field": "quantity", "new_value": "5", "operation": "delete"}]}',
+    '{"status": "edit", "edits": [{"item": "rice", "field": "quantity", "new_value": "5", "amount": "2500"}]}',
+])
+def test_malformed_or_overreaching_plans_never_reach_the_database(llm_reply):
+    result = propose_without_db("Change rice quantity on receipt #1 to 5", llm_reply)
+    assert result.edits == [] and result.message
+
+
+@pytest.mark.parametrize("edits", [
+    [{"receipt_id": 7, "item": "rice"}],                                                  # invented receipt
+    [{"item": "rice", "line_no": 3}],                                                     # invented line
+    [{"receipt_id": 1, "item": "rice"}, {"receipt_id": 1, "item": "oil"}],                # extra row
+    [{"receipt_id": 1, "item": "rice"}, {"receipt_id": 1, "item": "rice", "field": "amount", "new_value": "9"}],
+    [{"receipt_id": 1, "item": "rice", "new_value": "50"}],                               # value not asked for
+    [{"item": f"rice {n}"} for n in range(config.MAX_EDITS_PER_REQUEST + 1)],             # bulk
+])
+def test_plans_that_go_beyond_the_request_never_reach_the_database(edits):
+    result = propose_without_db("Change rice quantity on receipt #1 to 5", plan(edits=edits))
+    assert result.edits == [] and result.message
+
+
+# --- Shop / invoice grounding ------------------------------------------------------------
+
+@pytest.mark.parametrize("merchants, invoices, edits, expected_merchant, problem", [
+    (set(), set(), [req(item="rice", merchant="Shree")], "Shree", None),          # nothing named: unchanged
+    ({"Ambikeshar Pharma"}, set(), [req(item="rice", merchant="ambikeshar pharma")], "Ambikeshar Pharma", None),
+    ({"Ambikeshar Pharma"}, set(), [req(item="rice", merchant="Ambikeshar")], "Ambikeshar Pharma", None),
+    ({"Ambikeshar Pharma", "Himalayan Pharma"}, set(), [req(item="rice", merchant="Ambikeshar Pharma")], None,
+     "more than one shop"),
+    ({"Ambikeshar Pharma"}, set(), [req(item="rice")], None, "wasn't sure"),         # model dropped the shop
+    ({"Ambikeshar Pharma"}, set(), [req(item="rice", merchant="Himalayan")], None, "wasn't sure"),
+    (set(), {"INV-1", "INV-2"}, [req(item="rice", invoice_number="INV-2")], None, "more than one invoice"),
+])
+def test_ground_bill_names(merchants, invoices, edits, expected_merchant, problem):
+    grounded, message = edit.ground_bill_names(edits, merchants, invoices)
+    if problem is None:
+        assert message is None and grounded[0].merchant == expected_merchant
+    else:
+        assert grounded is None and problem in message
+
+
+@pytest.fixture
+def pharmacies(conn):
+    """#1 and #2 Ambikeshar Pharma (Rice), #3 Himalayan Pharma (Rice), #4 Ambikeshar Ayurvedic Pharma (Honey)."""
+    save(conn, "Ambikeshar Pharma", "AP-1", [_line("Rice", 2, 50000)])
+    save(conn, "Ambikeshar Pharma", "AP-2", [_line("Rice", 3, 50000)])
+    save(conn, "Himalayan Pharma", "HP-1", [_line("Rice", 1, 50000)])
+    save(conn, "Ambikeshar Ayurvedic Pharma", "AAP-1", [_line("Honey", 1, 40000)])
+
+
+@requires_test_db
+def test_bill_names_in_finds_whole_names_only(pharmacies, conn):
+    merchants, invoices = db.bill_names_in(conn, "Compare Ambikeshar Ayurvedic Pharma with HP-1 and AP-12")
+    assert merchants == {"Ambikeshar Ayurvedic Pharma"} and invoices == {"HP-1"}
+
+
+@requires_test_db
+def test_same_merchant_on_two_receipts_asks_which(pharmacies, conn):
+    result = propose("Change rice quantity to 5 for Ambikeshar Pharma",
+                     [{"merchant": "Ambikeshar Pharma", "item": "rice", "new_value": "5"}])
+    assert result.edits == [] and "more than one line" in result.message and proposal_statuses(conn) == []
+
+
+@requires_test_db
+@pytest.mark.parametrize("llm_merchant", ["Ambikeshar Pharma", "Himalayan Pharma"])
+def test_two_shops_mentioned_asks_which_whatever_the_model_picks(pharmacies, conn, llm_merchant):
+    question = ("I was comparing Ambikeshar Pharma with Himalayan Pharma. "
+                "Change the rice quantity to 5 for Ambikeshar Pharma.")
+    result = propose(question, [{"merchant": llm_merchant, "item": "rice", "new_value": "5"}])
+    assert result.edits == [] and "more than one shop" in result.message and proposal_statuses(conn) == []
+
+
+@requires_test_db
+def test_one_shop_named_resolves_to_its_exact_ledger_name(pharmacies, conn):
+    result = propose("Change honey quantity to 2 for Ambikeshar Ayurvedic Pharma",
+                     [{"merchant": "Ambikeshar", "item": "honey", "new_value": "2"}])
+    assert [(p.receipt_id, p.merchant_name, p.item) for p in result.edits] == [
+        (4, "Ambikeshar Ayurvedic Pharma", "Honey")]
+
+
+@requires_test_db
+def test_misspelled_shop_is_not_fuzzy_matched(pharmacies, conn):
+    result = propose("Change honey quantity to 2 for ambikehsar ayurvedic pharma",
+                     [{"merchant": "ambikehsar ayurvedic pharma", "item": "honey", "new_value": "2"}])
+    assert result.edits == [] and "couldn't find" in result.message and proposal_statuses(conn) == []
+
+
+@requires_test_db
+def test_two_invoices_mentioned_asks_which(ledger, conn):
+    result = propose("I compared INV-1 and INV-2; change rice quantity on INV-2 to 5",
+                     [{"invoice_number": "INV-2", "item": "rice", "new_value": "5"}])
+    assert result.edits == [] and "more than one invoice" in result.message
+
+
+@requires_test_db
+def test_description_can_be_set_to_a_shop_like_name(ledger, conn):
+    result = propose("Rename line 3 on receipt #1 to Ambik Pharma",
+                     [{"receipt_id": 1, "line_no": 3, "field": "description", "new_value": "Ambik Pharma"}])
+    assert approve(result).applied
+    assert quantities(conn)[2] == (1, 3, "Ambik Pharma", 4.0)
+    assert conn.execute("SELECT merchant_name FROM receipts WHERE id = 1").fetchone() == ("Shree Traders",)
+
+
+# --- Session binding and proposal-id swapping ---------------------------------------------
+
+@requires_test_db
+def test_a_session_cannot_use_another_sessions_proposal_id(ledger, conn):
+    before = tables(conn)
+    mine = propose(*RICE_2_TO_5, session="session-a")
+    theirs = propose("Set wheat quantity on receipt #1 to 6", [{"receipt_id": 1, "item": "wheat", "new_value": "6"}],
+                     session="session-b")
+    assert approve(mine, session="session-b").status == "unavailable"
+    assert edit.cancel_edit(theirs.edits[0].proposal_id, "session-a", connect=connect).status == "unavailable"
+    assert edit.apply_edit(str(uuid.uuid4()), "session-b", connect=connect).status == "unavailable"
+    assert tables(conn) == before and proposal_statuses(conn) == ["pending", "pending"]
+
+
+def test_approval_takes_no_target_or_value_from_the_caller():
+    params = set(inspect.signature(edit.apply_edit).parameters)
+    assert params == {"proposal_id", "session_id", "now", "today", "connect"}
+    assert set(inspect.signature(edit.cancel_edit).parameters) == {"proposal_id", "session_id", "now", "connect"}
+
+
+@requires_test_db
+def test_tampering_with_every_card_field_changes_nothing_about_the_write(ledger, conn):
+    result = propose(*RICE_2_TO_5)
+    card = result.edits[0]
+    for name, value in {"receipt_id": 2, "line_no": 3, "field": "description", "item": "Wheat",
+                        "merchant_name": "Hari Stores", "invoice_number": "INV-2", "date_ad": date(2020, 1, 1),
+                        "current_text": "4", "new_text": "999"}.items():
+        setattr(card, name, value)
+    assert approve(result).applied
+    assert quantities(conn) == [(1, 1, "Rice", 5.0), (1, 2, "Rice", 3.0), (1, 3, "Wheat", 4.0), (2, 1, "Rice", 2.0)]
+
+
+# --- Lifecycle: every terminal state is final -------------------------------------------
+
+def _make_terminal(state, result, conn):
+    pid = result.edits[0].proposal_id
+    if state == "applied":
+        assert approve(result).applied
+    elif state == "cancelled":
+        assert edit.cancel_edit(pid, SESSION, now=LATER, connect=connect).status == "cancelled"
+    elif state == "stale":
+        conn.execute("UPDATE line_items SET quantity = 4 WHERE receipt_id = 1 AND line_no = 1")
+        assert approve(result).status == "stale"
+    else:
+        assert approve(result, now=NOW + TTL).status == "expired"
+
+
+@requires_test_db
+@pytest.mark.parametrize("state", ["applied", "cancelled", "stale", "expired"])
+def test_terminal_states_are_final(ledger, conn, state):
+    result = propose(*RICE_2_TO_5)
+    _make_terminal(state, result, conn)
+    after = tables(conn)
+    assert proposal_statuses(conn) == [state]
+    assert not approve(result).applied and not approve(result, now=NOW).applied
+    cancelled = edit.cancel_edit(result.edits[0].proposal_id, SESSION, connect=connect)
+    assert cancelled.status in ("already_decided", "expired")
+    for target in ("pending", "applied", "cancelled", "stale", "expired"):
+        if target != state:
+            with pytest.raises(psycopg.errors.RaiseException, match="is final"):
+                conn.execute("UPDATE line_item_edits SET status = %s, decided_at = now()", (target,))
+    assert tables(conn) == after and proposal_statuses(conn) == [state]

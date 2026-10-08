@@ -29,6 +29,13 @@ def no_rag(monkeypatch):
     monkeypatch.setattr(config, "has_rag_config", lambda: False)
 
 
+@pytest.fixture(autouse=True)
+def no_edit_planner(monkeypatch):
+    """Hermetic by default: the edit planner (an LLM call) treats every message as a question.
+    The edit tests below replace this with their own stub."""
+    monkeypatch.setattr(edit, "propose_edits", lambda question, session_id, **kw: None)
+
+
 def start(monkeypatch, outcomes: dict[str, QueryResult]) -> AppTest:
     """outcomes maps question text -> the QueryResult answer_question should return for it."""
     monkeypatch.setattr(ask, "answer_question", lambda question, today, **kw: outcomes[question])
@@ -249,8 +256,10 @@ PROPOSAL = EditProposal(
 )
 
 
-def start_with_edits(monkeypatch, proposed: dict[str, QueryResult | None], answers: dict[str, QueryResult] | None = None):
-    calls = {"propose": [], "apply": [], "cancel": [], "ask": []}
+def start_with_edits(
+    monkeypatch, proposed: dict[str, QueryResult | None], answers: dict[str, QueryResult] | None = None,
+):
+    calls = {"propose": [], "apply": [], "apply_kwargs": [], "cancel": [], "ask": []}
 
     def propose(question, session_id, **kw):
         calls["propose"].append(question)
@@ -262,6 +271,7 @@ def start_with_edits(monkeypatch, proposed: dict[str, QueryResult | None], answe
 
     def apply(proposal_id, session_id, **kw):
         calls["apply"].append((proposal_id, session_id))
+        calls["apply_kwargs"].append(kw)
         return edit.EditOutcome("applied", "Updated receipt #12, line 1 (Rice 25kg): quantity 2 → 5.")
 
     def cancel(proposal_id, session_id, **kw):
@@ -304,6 +314,7 @@ def test_approve_applies_exactly_that_proposal_once_for_this_session(monkeypatch
     at = at.button(key="approve_p-1").click().run()
     assert not at.exception
     assert calls["apply"] == [("p-1", at.session_state["ask_session_id"])]
+    assert calls["apply_kwargs"] == [{}]  # nothing but the proposal id and the server's session id
     assert any("quantity 2 → 5" in s.value for s in at.success)
     assert not [b for b in at.button if b.key in ("approve_p-1", "cancel_p-1")]  # decided: no more buttons
     at.run()  # later reruns render the outcome, never re-apply
@@ -344,3 +355,21 @@ def test_typing_yes_in_the_chat_does_not_approve_a_pending_change(monkeypatch):
     at = ask_question(at, reply)
     assert calls["apply"] == []
     assert at.button(key="approve_p-1").label == "Approve change"  # still waiting for the click
+
+
+def test_session_id_is_generated_server_side_and_not_taken_from_the_url(monkeypatch):
+    at, calls = start_with_edits(monkeypatch, {EDIT_QUESTION: proposed_result()})
+    at.query_params["session_id"] = "victim-session"
+    at.query_params["ask_session_id"] = "victim-session"
+    at = ask_question(at, EDIT_QUESTION)
+    at = at.button(key="approve_p-1").click().run()
+    (_, used_session), = calls["apply"]
+    assert used_session == at.session_state["ask_session_id"] != "victim-session"
+    assert len(used_session) == 32  # uuid4().hex
+
+
+def test_each_browser_session_gets_its_own_session_id(monkeypatch):
+    first, _ = start_with_edits(monkeypatch, {EDIT_QUESTION: proposed_result()})
+    second, _ = start_with_edits(monkeypatch, {EDIT_QUESTION: proposed_result()})
+    ids = [ask_question(at, EDIT_QUESTION).session_state["ask_session_id"] for at in (first, second)]
+    assert ids[0] != ids[1]
