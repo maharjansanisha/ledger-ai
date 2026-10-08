@@ -152,6 +152,7 @@ def _get_plan(question: str, *, client=None) -> tuple[EditPlan | None, str | Non
         response = llm_client.call_json(
             prompt, namespace="edit", prompt_version=config.EDIT_PROMPT,
             cache_input=question, response_schema=EditPlan, client=client,
+            cache_schema=_StrictEditPlan,  # a plan we refuse to parse is never cached and replayed
         )
     except llm_client.LLMError as exc:
         return None, exc.user_message

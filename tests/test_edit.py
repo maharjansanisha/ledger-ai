@@ -18,7 +18,7 @@ import psycopg
 import pytest
 from psycopg.conninfo import conninfo_to_dict
 
-from bahikhata import config, db, edit, sql_guard
+from bahikhata import config, db, edit, llm_client, sql_guard
 from bahikhata.schemas import ConfirmedReceipt
 from tests.fakes import FakeClient, server_error
 
@@ -991,3 +991,37 @@ def test_terminal_states_are_final(ledger, conn, state):
             with pytest.raises(psycopg.errors.RaiseException, match="is final"):
                 conn.execute("UPDATE line_item_edits SET status = %s, decided_at = now()", (target,))
     assert tables(conn) == after and proposal_statuses(conn) == [state]
+
+
+
+# --- Planner cache: only replies that parse strictly are cached ---------------------------
+
+GOOD_PLAN = plan(edits=[{"receipt_id": 1, "item": "rice"}])
+OVERREACHING_PLAN = ('{"status": "edit", "edits": [{"receipt_id": 1, "item": "rice", "field": "quantity", '
+                     '"new_value": "5", "operation": "delete"}]}')
+
+
+def test_a_rejected_plan_is_not_cached_so_asking_again_reaches_the_model():
+    question = "Change rice quantity on receipt #1 to 5"
+    first, error = edit._get_plan(question, client=FakeClient(OVERREACHING_PLAN))
+    assert first is None and "rephrasing" in error
+    retry_client = FakeClient(GOOD_PLAN)
+    second, error = edit._get_plan(question, client=retry_client)
+    assert error is None and second.edits[0].item == "rice"
+    assert len(retry_client.calls) == 1  # went to the model, not to a cached rejection
+
+
+def test_a_valid_plan_is_cached():
+    question = "Change rice quantity on receipt #1 to 5"
+    edit._get_plan(question, client=FakeClient(GOOD_PLAN))
+    replay, error = edit._get_plan(question, client=FakeClient())  # no outcomes queued: must be a cache hit
+    assert error is None and replay.edits[0].item == "rice"
+
+
+def test_a_previously_cached_rejected_plan_is_dropped_and_refetched():
+    """An entry cached before this rule (lenient schema only) is no longer served."""
+    question = "Change rice quantity on receipt #1 to 5"
+    llm_client.call_json("x", namespace="edit", prompt_version=config.EDIT_PROMPT, cache_input=question,
+                         response_schema=edit.EditPlan, client=FakeClient(OVERREACHING_PLAN))
+    refetched, error = edit._get_plan(question, client=FakeClient(GOOD_PLAN))
+    assert error is None and refetched.edits[0].item == "rice"

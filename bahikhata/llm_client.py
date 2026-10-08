@@ -142,19 +142,21 @@ def _call(
     cache_input: str,
     response_schema: type[BaseModel] | None,
     client,
+    cache_schema: type[BaseModel] | None = None,
 ) -> LLMResponse:
     model_name = config.MODEL_NAME
+    cache_schema = cache_schema or response_schema
     key = cache_key(namespace, model_name, prompt_version, cache_input)
     cached = _cache_read(key)
     if cached is not None:
-        if _matches_schema(cached["text"], response_schema):
+        if _matches_schema(cached["text"], cache_schema):
             return LLMResponse(cached["text"], model_name, prompt_version, cache_hit=True, latency_s=0.0)
         (config.CACHE_DIR / f"{key}.json").unlink(missing_ok=True)  # e.g. hand-edited: call the API again
 
     start = time.perf_counter()
     text = _generate(client or _default_client(), model_name, contents, response_schema)
     latency = time.perf_counter() - start
-    if not _matches_schema(text, response_schema):
+    if not _matches_schema(text, cache_schema):
         # Never cache an unparseable answer: "Try again" must reach the API, not replay it.
         return LLMResponse(text, model_name, prompt_version, cache_hit=False, latency_s=latency)
     _cache_write(key, {
@@ -204,10 +206,14 @@ def call_json(
     cache_input: str,
     response_schema: type[BaseModel] | None = None,
     client=None,
+    cache_schema: type[BaseModel] | None = None,
 ) -> LLMResponse:
     """Text prompt -> raw JSON text (used later for SQL planning, A§6).
 
     The caller fills the prompt and chooses `cache_input` (for SQL: question + today).
+    `cache_schema` (default: response_schema) is what a response must parse as to be cached
+    or served from the cache -- for a caller that parses more strictly than the schema sent
+    to the provider, so an answer it rejects is never replayed.
     """
     return _call(
         namespace=namespace,
@@ -216,4 +222,5 @@ def call_json(
         cache_input=cache_input,
         response_schema=response_schema,
         client=client,
+        cache_schema=cache_schema,
     )
