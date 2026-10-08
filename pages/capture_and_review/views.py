@@ -34,7 +34,7 @@ def label(text: str, form_field: str) -> str:
 
 def field_messages(grouped, form_field: str) -> None:
     for flag in grouped.get(form_field, []):
-        st.caption(f"{_SEVERITY_ICON[flag.severity]} {flag.severity}: {flag.message}")
+        st.caption(f"{_SEVERITY_ICON[flag.severity]} {review.display_message(flag)}")
 
 
 def render_header() -> None:
@@ -88,7 +88,7 @@ def render_status(current: review.Review, grouped) -> None:
     note = f" · {inline} message(s) shown next to the fields below" if inline else ""
     st.markdown(f"**Status:** {_STATUS_TEXT[current.status]}{note}")
     for flag in grouped.get(None, []):
-        st.markdown(f"{_SEVERITY_ICON[flag.severity]} **{flag.severity}** — {flag.message}")
+        st.markdown(f"{_SEVERITY_ICON[flag.severity]} {review.display_message(flag)}")
 
 
 def _merchant_fields(header: dict, base: dict, grouped, v: int) -> None:

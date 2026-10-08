@@ -123,7 +123,8 @@ def test_extract_populates_the_form(env):
 def test_blocking_flag_disables_save(env):
     env(json.dumps({**GOOD, "total_raw": None}))
     at = extract(start(png()))
-    assert "⛔ BLOCKING: V1: total is missing" in text(at)
+    assert "⛔ Total is missing" in text(at)
+    assert "V1" not in text(at) and "BLOCKING" not in text(at)    # internal IDs never shown
     assert save_button(at).disabled
 
 
@@ -134,8 +135,9 @@ def test_revalidate_reparses_edits(env):
     at.text_input(key="date_raw_1").set_value("03/04/2026")
     submit(at, "Re-validate")
     assert not at.exception
-    assert "total is missing" not in text(at)
-    assert "2026-04-03" in text(at) and "N3" in text(at)          # date re-parsed, DD/MM warning
+    assert "total is missing" not in text(at).lower()
+    assert "2026-04-03" in text(at) and "assumed DD/MM" in text(at)  # date re-parsed, DD/MM warning
+    assert "N3" not in text(at)
     assert not save_button(at).disabled
     assert at.text_input(key="total_1").value == "Rs. 1,130/-"    # the user's text is kept
 
@@ -145,7 +147,8 @@ def test_unparseable_amount_shows_inline_error(env):
     at = extract(start(png()))
     at.text_input(key="vat_1").set_value("1.30.00")
     submit(at, "Re-validate")
-    assert any("N1" in c.value and "1.30.00" in c.value for c in at.caption)
+    assert any(c.value.startswith("⚠️ Amount '1.30.00' could not be read") for c in at.caption)
+    assert not any("N1" in c.value for c in at.caption)
 
 
 def test_v5_needs_save_anyway_checkbox(env, monkeypatch, switched):
@@ -154,7 +157,8 @@ def test_v5_needs_save_anyway_checkbox(env, monkeypatch, switched):
     monkeypatch.setattr("bahikhata.db.get_connection", lambda: _FakeConn())
     monkeypatch.setattr("bahikhata.db.save_confirmed_receipt", lambda c, r, p, a: saved.setdefault("r", r) and 9)
     at = extract(start(png()))
-    assert "❗ ERROR: V5:" in text(at)
+    assert "❗ Subtotal " in text(at) and "but total is 1,220.00" in text(at)
+    assert "V5" not in text(at) and "ERROR" not in text(at)
     submit(at, "Confirm & Save")                    # without the checkbox
     assert "save anyway" in at.error[0].value and "r" not in saved
     at.checkbox(key="override_1").check()
@@ -310,9 +314,9 @@ def test_missing_total_message_is_shown_under_the_total_field(env):
     at = extract(start(png()))
     below_total = element_after(at, "total_1")
     assert below_total.type == "caption"
-    assert below_total.value == "⛔ BLOCKING: V1: total is missing"
+    assert below_total.value == "⛔ Total is missing"
     assert at.text_input(key="total_1").label == "Total *"
-    assert "total is missing" not in "\n".join(m.value for m in at.markdown)  # not repeated at the top
+    assert "total is missing" not in "\n".join(m.value for m in at.markdown).lower()  # not repeated at the top
 
 
 def test_cant_save_line_appears_then_disappears_after_fixing(env):

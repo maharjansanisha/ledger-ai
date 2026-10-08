@@ -171,3 +171,14 @@ def test_save_hint():
     assert review.save_hint(blocked) == "Can't save yet: total is missing; choose a category."
     v5 = review.revalidate({**HEADER, "total": "1,220"}, ROWS, TODAY)
     assert "save anyway" in review.save_hint(v5)
+    assert "V5" not in review.save_hint(v5)
+
+
+def test_display_message_hides_rule_ids_but_flags_keep_them():
+    blocked = review.revalidate({**HEADER, "merchant_name": ""}, ROWS, TODAY)
+    v1 = next(f for f in blocked.flags if f.rule_id == "V1")
+    assert (v1.severity, v1.message) == ("BLOCKING", "V1: merchant name is missing")  # internal: unchanged
+    assert review.display_message(v1) == "Merchant name is missing"
+    v5 = next(f for f in review.revalidate({**HEADER, "total": "1,220"}, ROWS, TODAY).flags if f.rule_id == "V5")
+    assert v5.severity == "ERROR" and v5.message.startswith("V5: subtotal ")
+    assert review.display_message(v5).startswith("Subtotal ") and "V5" not in review.display_message(v5)

@@ -106,13 +106,20 @@ def _short_message(flag: ValidationFlag) -> str:
     return re.sub(r"\s*\(one of:.*\)$", "", message)
 
 
+def display_message(flag: ValidationFlag) -> str:
+    """A flag's message as shown in the form: no internal rule ID, first letter capitalised.
+    "V1: merchant name is missing" -> "Merchant name is missing"."""
+    message = _short_message(flag)
+    return message[:1].upper() + message[1:]
+
+
 def save_hint(current: Review) -> str | None:
     """One line under the buttons explaining why saving is not possible yet, or None."""
     blocking = [_short_message(f) for f in current.flags if f.severity == "BLOCKING"]
     if blocking:
         return "Can't save yet: " + "; ".join(blocking) + "."
     if current.needs_override:
-        return ("The amounts don't add up (V5): check them, then tick "
+        return ("The amounts don't add up: check them, then tick "
                 "“I checked this, save anyway” to save.")
     return None
 
