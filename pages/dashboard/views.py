@@ -9,8 +9,8 @@ from pages.dashboard.data import DashboardData, Filters
 def render_banner() -> None:
     st.html("""
 <div class="bk-hero">
-  <div class="bk-tag">Receipt-to-ledger assistant</div>
-  <h1>BahiKhata AI</h1>
+  <div class="bk-tag">Intelligent Bookkeeping Assistant</div>
+  <h1>Ledger AI</h1>
   <p>Receipt-to-ledger assistant for Nepali small businesses. Snap a receipt, review what was read,
   then explore your spending on the dashboard or ask questions in plain language.</p>
 </div>

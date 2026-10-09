@@ -1,4 +1,4 @@
-# BahiKhata AI — Architecture
+# Ledger AI — Architecture
 
 | | |
 |---|---|
@@ -102,7 +102,7 @@ Everything else in Amendment A1: psycopg v3 for app code, `.env` variable names,
 
 ### What the system does
 
-BahiKhata AI is **one local Python application** that does two jobs:
+Ledger AI is **one local Python application** that does two jobs:
 
 1. **Capture:** turn a receipt photo into a ledger record that has been checked by code and confirmed by a person.
 2. **Query:** answer questions about saved records by running SQL against the local database.
@@ -172,7 +172,7 @@ The user uploads a photo. Intake checks it and shrinks it. The LLM client sends 
 
 ## 2. Architecture Principles
 
-| # | Principle | What it means in BahiKhata AI |
+| # | Principle | What it means in Ledger AI |
 |---|---|---|
 | P1 | **The database is the financial source of truth** | Every number shown on the dashboard or in an answer is read from SQLite. No LLM output is shown as a financial figure unless it came from a database row. |
 | P2 | **Deterministic code for calculations and validation** | Sums, VAT checks, paisa conversion and BS↔AD conversion are Python and library code with unit tests. The same input always gives the same output. |

@@ -14,7 +14,7 @@ from pages.capture_and_review import state, views
 
 DASHBOARD = "pages/dashboard/page.py"
 
-st.set_page_config(page_title="Capture & Review · BahiKhata AI", page_icon="🧾", layout="wide")
+st.set_page_config(page_title="Capture & Review · Ledger AI", page_icon="🧾", layout="wide")
 S = st.session_state
 
 # --- Upload, or load the receipt being edited ---------------------------------

@@ -11,7 +11,7 @@ import streamlit as st
 from bahikhata import config
 from pages.ask_your_ledger import state, views
 
-st.set_page_config(page_title="Ask Your Ledger · BahiKhata AI", page_icon="💬", layout="wide")
+st.set_page_config(page_title="Ask Your Ledger · Ledger AI", page_icon="💬", layout="wide")
 
 rag_enabled = config.has_rag_config()
 views.render_header(show_tips=not state.history(), rag_enabled=rag_enabled)

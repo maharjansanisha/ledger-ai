@@ -1,7 +1,7 @@
 [project]
 name = "bahikhata-ai"
 version = "0.1.0"
-description = "Receipt-to-ledger assistant for Nepali small businesses (student MVP)."
+description = "Ledger AI, an intelligent bookkeeping assistant: receipt-to-ledger for Nepali small businesses (student MVP)."
 requires-python = ">=3.11"
 # Runtime dependencies: exactly the list approved in ARCHITECTURE.md §18.
 # sqlite3 is part of the Python standard library, so it is not listed.

@@ -1,10 +1,10 @@
-# Bahikhata AI — Features & GenAI Roadmap
+# Ledger AI — Features & GenAI Roadmap
 
 As of 2026-10-07.
 
 ## Overview
 
-Bahikhata AI turns photos of purchase receipts and VAT bills into a checked ledger for small Nepali businesses, then lets the owner query it in plain English. The core loop is capture, extract, validate, human confirm, store, query. Scope today is purchase and expense bills only, one user, one business, NPR, 13% VAT.
+Ledger AI turns photos of purchase receipts and VAT bills into a checked ledger for small Nepali businesses, then lets the owner query it in plain English. The core loop is capture, extract, validate, human confirm, store, query. Scope today is purchase and expense bills only, one user, one business, NPR, 13% VAT.
 
 | Layer | Choice |
 | --- | --- |

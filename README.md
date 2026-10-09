@@ -1,4 +1,6 @@
-# BahiKhata AI
+# Ledger AI
+
+**Intelligent Bookkeeping Assistant**
 
 Receipt-to-ledger assistant for Nepali small businesses (student MVP). Snap a receipt, let Gemini extract it, review and confirm, then explore your ledger on a dashboard or ask questions in plain language.
 

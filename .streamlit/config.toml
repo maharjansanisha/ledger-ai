@@ -1,4 +1,4 @@
-# Visual theme for the BahiKhata AI Streamlit app.
+# Visual theme for the Ledger AI Streamlit app.
 [theme]
 base = "light"
 primaryColor = "#0F766E"

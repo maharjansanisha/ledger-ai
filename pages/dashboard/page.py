@@ -11,7 +11,7 @@ import streamlit as st
 from pages.capture_and_review.state import NOTICE_KEY
 from pages.dashboard import data, views
 
-st.set_page_config(page_title="Dashboard · BahiKhata AI", page_icon="📊", layout="wide")
+st.set_page_config(page_title="Dashboard · Ledger AI", page_icon="📊", layout="wide")
 
 views.render_notice(st.session_state.pop(NOTICE_KEY, None))
 views.render_banner()
