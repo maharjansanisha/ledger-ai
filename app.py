@@ -4,7 +4,7 @@ import streamlit as st
 
 ROOT = Path(__file__).parent
 
-st.set_page_config(page_title="BahiKhata AI", page_icon=str(ROOT / "assets/icon.svg"), layout="wide")
+st.set_page_config(page_title="Ledger AI", page_icon=str(ROOT / "assets/icon.svg"), layout="wide")
 st.logo(str(ROOT / "assets/logo.svg"), size="large")
 
 st.html("""

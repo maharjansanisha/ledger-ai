@@ -1,4 +1,4 @@
-# BahiKhata AI — Product Requirements Document
+# Ledger AI — Product Requirements Document
 
 | | |
 |---|---|
@@ -12,11 +12,11 @@
 
 ## 1. Product title
 
-**BahiKhata AI** — receipt-to-ledger assistant for Nepali small businesses.
+**Ledger AI** — Intelligent Bookkeeping Assistant: a receipt-to-ledger assistant for Nepali small businesses.
 
 ## 2. One-sentence product definition
 
-BahiKhata AI turns photos of Nepali purchase receipts and VAT bills into validated, human-confirmed ledger records stored in a local database, and answers questions about those records by running SQL against the database, never from the model's memory.
+Ledger AI turns photos of Nepali purchase receipts and VAT bills into validated, human-confirmed ledger records stored in a local database, and answers questions about those records by running SQL against the database, never from the model's memory.
 
 ## 3. Problem statement
 

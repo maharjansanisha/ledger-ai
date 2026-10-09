@@ -1,4 +1,4 @@
-"""Central settings for BahiKhata AI (ARCHITECTURE.md §3.15).
+"""Central settings for Ledger AI (ARCHITECTURE.md §3.15).
 
 One place for paths, prompt versions, tolerances and limits, so no module
 hides "magic numbers". Secrets are NOT stored here: they come from environment
