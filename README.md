@@ -1,4 +1,4 @@
-# BahiKhata AI
+# Ledger AI
 
 Receipt-to-ledger assistant for Nepali small businesses (student MVP). Snap a receipt, let Gemini extract it, review and confirm, then explore your ledger on a dashboard or ask questions in plain language.
 
@@ -100,7 +100,7 @@ Run `make help` for the full list. Every target accepts `TARGET=main|eval|test` 
 ```
 app.py            Streamlit entry point (home page)
 pages/            Streamlit pages (capture, dashboard, ask)
-bahikhata/        App logic: extraction, validation, normalisation, DB, SQL guard, ask
+ledger/        App logic: extraction, validation, normalisation, DB, SQL guard, ask
 prompts/          Versioned LLM prompts (extraction, SQL, explain)
 migrations/       Alembic migrations
 tests/            pytest suite
